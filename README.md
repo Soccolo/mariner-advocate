@@ -47,6 +47,29 @@ arbitration fails, completed Z.AI and Claude analyses remain available in the
 is retried once with the same model, JSON mode, a larger output allowance, and hidden
 thinking disabled.
 
+### Reasoning models share one output allowance
+
+Both `claude-opus-5` and `glm-5.3` reason before answering, and that reasoning is
+billed from the same output allowance as the final JSON. If the allowance runs out
+mid-answer, the model returns a partial document, so the budgets default to 32,000
+tokens rather than the answer-sized budget a non-reasoning model would need.
+
+- Claude requests stream, ask for the analysis shape as a **structured output**, and
+  set `thinking` and `effort` explicitly. If a model or account does not accept the
+  structured-output or effort fields, the request is retried without them instead of
+  failing the stage.
+- When a model still stops mid-answer, the complete leading part of its response is
+  recovered and used. Cuts are only made at separators outside strings, so every value
+  kept is one the model finished writing, and anything it was part-way through is
+  dropped rather than guessed. The stage is flagged as partial in the **Analyses**
+  tab, listed under **Provider status details**, marked in the arbiter's input, and
+  the panel reports reduced coverage.
+- Failures record the provider's machine-readable error code, HTTP status, and finish
+  reason so a misconfigured model ID or exhausted budget is visible in the app. Only
+  these enum-like codes are stored, never free-form provider text, because a provider
+  can echo submitted case facts back inside an error message and the failure record is
+  replayed into later provider prompts.
+
 Contract import accepts files up to 10 MB and rejects encrypted, scanned/no-text,
 macro-enabled, malformed, or excessively large documents. Existing case values are
 preserved by default, and all imported values remain editable before panel analysis.
@@ -98,6 +121,9 @@ Supported settings:
 | `OPENAI_MODEL` | `gpt-5.6-sol` | OpenAI model ID |
 | `ANTHROPIC_MODEL` | `claude-opus-5` | Anthropic model ID |
 | `ZAI_MODEL` | `glm-5.3` | Z.AI model ID |
+| `ANTHROPIC_MAX_TOKENS` | `32000` | Claude output allowance, covering thinking and the answer (4,000-128,000) |
+| `ANTHROPIC_EFFORT` | `high` | Claude reasoning depth: `low`, `medium`, `high`, `xhigh`, or `max` |
+| `ZAI_MAX_TOKENS` | `32000` | Z.AI output allowance, covering reasoning and the answer (4,000-128,000) |
 | `APP_PASSWORD` | none | Basic shared-password gate |
 | `DEMO_MODE` | `false` | Use deterministic fake responses and no APIs |
 | `PUBLIC_DEMO_ONLY` | `false` | Force demo mode and require fictional-data acknowledgment |
@@ -194,4 +220,7 @@ streamlit run streamlit_app.py --server.headless true
 ```
 
 The original Node prototype remains in `server.mjs` and `public/`, but
-`streamlit_app.py` is the deployment entry point.
+`streamlit_app.py` is the deployment entry point. The prototype still carries the
+original answer-sized output budgets and non-streaming requests, so it drops
+reasoning-model responses that the Streamlit app now handles. Treat it as historical
+reference, not a second supported entry point.
