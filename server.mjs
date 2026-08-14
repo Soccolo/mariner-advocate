@@ -17,11 +17,11 @@ const config = {
   },
   anthropic: {
     key: process.env.ANTHROPIC_API_KEY,
-    model: process.env.ANTHROPIC_MODEL || "claude-opus-4-8",
+    model: process.env.ANTHROPIC_MODEL || "claude-opus-5",
   },
   zai: {
     key: process.env.ZAI_API_KEY,
-    model: process.env.ZAI_MODEL || "glm-5.1",
+    model: process.env.ZAI_MODEL || "glm-5.3",
   },
 };
 

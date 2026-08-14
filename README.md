@@ -1,8 +1,8 @@
 # Mariner Advocate
 
-Mariner Advocate is a Streamlit application for multi-model legal issue-spotting,
-independent review, senior arbitration, next-step discussion, and careful document
-drafting. It is initially tailored to injured seafarers.
+Mariner Advocate is a Streamlit application for contract-assisted case intake,
+multi-model legal issue-spotting, independent review, senior arbitration, next-step
+discussion, and careful document drafting. It is initially tailored to injured seafarers.
 
 ## Critical privacy boundary
 
@@ -17,22 +17,31 @@ control, restricted network access, safe logging, secrets management, monitoring
 and an agreed retention/deletion policy. Review each AI provider's data-processing
 and retention terms before sending case facts. The included `APP_PASSWORD` is only a
 basic shared gate; it is not a substitute for production authentication.
+Live mode fails closed before case intake when `APP_PASSWORD` is missing.
 
 This project has no database. Case details and results live in a Streamlit session
 until that session ends, but live requests send the submitted facts to Z.AI,
-Anthropic, and OpenAI.
+Anthropic, and OpenAI. If the user explicitly runs contract import, locally extracted
+contract text is sent to OpenAI to populate contract-related intake fields.
 
 ## Review workflow
 
-1. Z.AI performs the first independent analysis.
-2. Claude forms a separate view concurrently, without seeing the first answer.
-3. After committing its view, Claude compares both analyses and identifies
+1. An optional PDF, DOCX, or TXT contract importer extracts text locally and asks
+   OpenAI to populate only vessel, employment, and relevant contract-term fields.
+2. Z.AI performs the first independent analysis.
+3. Claude forms a separate view concurrently, without seeing the first answer.
+4. After committing its view, Claude compares both analyses and identifies
    disagreements, omissions, and unsupported claims.
-4. OpenAI acts as senior arbiter in high-reasoning pro mode, resolving only supported
+5. OpenAI acts as senior arbiter in high-reasoning pro mode, resolving only supported
    disputes and leaving genuine uncertainty visible.
-5. OpenAI can draft a notification, payment request, evidence-preservation request,
+6. OpenAI can draft a notification, payment request, evidence-preservation request,
    complaint, or chronology from the arbitrated record.
-6. A follow-up workspace discusses the next required steps using that same record.
+7. A follow-up workspace discusses the next required steps using that same record.
+
+Contract import accepts files up to 10 MB and rejects encrypted, scanned/no-text,
+macro-enabled, malformed, or excessively large documents. Existing case values are
+preserved by default, and all imported values remain editable before panel analysis.
+The upload control is not rendered when `PUBLIC_DEMO_ONLY=true`.
 
 API keys are read only from Streamlit secrets or server environment variables. They
 are never entered in the web page, returned to the browser, or included in exports.
@@ -71,20 +80,18 @@ Supported settings:
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `OPENAI_API_KEY` | none | OpenAI arbitration, drafting, and follow-up |
+| `OPENAI_API_KEY` | none | OpenAI contract extraction, arbitration, drafting, and follow-up |
 | `ANTHROPIC_API_KEY` | none | Blind review and comparison |
 | `ZAI_API_KEY` | none | First analysis |
 | `OPENAI_MODEL` | `gpt-5.6-sol` | OpenAI model ID |
-| `ANTHROPIC_MODEL` | `claude-opus-4-8` | Anthropic model ID |
-| `ZAI_MODEL` | `glm-5.1` | Z.AI model ID |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | Anthropic model ID |
+| `ZAI_MODEL` | `glm-5.3` | Z.AI model ID |
 | `APP_PASSWORD` | none | Basic shared-password gate |
 | `DEMO_MODE` | `false` | Use deterministic fake responses and no APIs |
 | `PUBLIC_DEMO_ONLY` | `false` | Force demo mode and require fictional-data acknowledgment |
 | `REQUEST_TIMEOUT_SECONDS` | `420` | Provider request timeout, bounded to 60-900 seconds |
 
-The requested name "GLM 5.3" was not listed in Z.AI's official API documentation
-when the initial MVP was built. If your Z.AI account exposes that exact model, set
-`ZAI_MODEL` to the model ID shown in your provider console.
+The defaults use Anthropic's `claude-opus-5` and Z.AI's `glm-5.3` model IDs.
 
 OpenAI's official model documentation identifies `gpt-5.6-sol` as the frontier model
 for complex work and documents `reasoning.mode: "pro"` on the Responses API:
@@ -103,7 +110,8 @@ docker build -t mariner-advocate .
 Run it on a private machine or private container platform:
 
 ```powershell
-docker run --rm -p 127.0.0.1:8501:8501 `
+docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m `
+  -p 127.0.0.1:8501:8501 `
   -e OPENAI_API_KEY `
   -e ANTHROPIC_API_KEY `
   -e ZAI_API_KEY `

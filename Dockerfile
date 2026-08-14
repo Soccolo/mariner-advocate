@@ -7,11 +7,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN groupadd --system mariner && \
+    useradd --system --gid mariner --create-home mariner
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY mariner_core.py streamlit_app.py ./
-COPY .streamlit/config.toml ./.streamlit/config.toml
+COPY --chown=mariner:mariner mariner_core.py streamlit_app.py ./
+COPY --chown=mariner:mariner .streamlit/config.toml ./.streamlit/config.toml
+
+USER mariner
 
 EXPOSE 8501
 
