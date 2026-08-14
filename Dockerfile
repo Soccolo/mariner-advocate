@@ -13,7 +13,8 @@ RUN groupadd --system mariner && \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=mariner:mariner mariner_core.py streamlit_app.py ./
+COPY --chown=mariner:mariner mariner_core.py pdf_report.py streamlit_app.py ./
+COPY --chown=mariner:mariner assets ./assets
 COPY --chown=mariner:mariner .streamlit/config.toml ./.streamlit/config.toml
 
 USER mariner

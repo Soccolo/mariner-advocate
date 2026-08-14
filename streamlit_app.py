@@ -19,6 +19,7 @@ from pypdf import PdfReader
 
 from mariner_core import (
     AppError,
+    FIELD_LABELS,
     MAX_CONTRACT_CHARS,
     ProviderConfig,
     analyze_case,
@@ -26,6 +27,7 @@ from mariner_core import (
     draft_document,
     extract_contract_fields,
 )
+from pdf_report import build_case_pdf, build_document_pdf
 
 
 st.set_page_config(
@@ -652,6 +654,42 @@ def slug(value: str) -> str:
     return "-".join(part for part in cleaned.split("-") if part)[:70] or "legal-draft"
 
 
+def export_stem(case_data: dict[str, Any]) -> str:
+    label = str((case_data or {}).get("shipName") or "").strip() or "seafarer-case"
+    return f"mariner-advocate-{slug(label)}"
+
+
+def case_pdf_bytes(panel: dict[str, Any], case_data: dict[str, Any]) -> bytes | None:
+    """Render the case-review PDF, reusing the last build when nothing changed.
+
+    Streamlit reruns the whole script on every interaction, so without this the
+    report would be re-rendered each time a checkbox is ticked.
+    """
+    discussion = st.session_state.get("discussion") or []
+    fingerprint = (
+        str(panel.get("generatedAt") or ""),
+        len(discussion),
+        hashlib.sha256(
+            json.dumps(case_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    )
+    cached = st.session_state.get("case_pdf")
+    if isinstance(cached, dict) and cached.get("key") == fingerprint:
+        return cached.get("data")
+    try:
+        data = build_case_pdf(
+            case_data, panel, field_labels=FIELD_LABELS, discussion=discussion
+        )
+    except AppError as exc:
+        st.caption(f"PDF unavailable: {exc}")
+        return None
+    except Exception:
+        st.caption("The PDF could not be produced because of an unexpected error.")
+        return None
+    st.session_state.case_pdf = {"key": fingerprint, "data": data}
+    return data
+
+
 def render_sidebar(config: ProviderConfig) -> None:
     with st.sidebar:
         st.header("Workspace")
@@ -682,13 +720,24 @@ def render_sidebar(config: ProviderConfig) -> None:
         panel = st.session_state.get("panel")
         case_data = st.session_state.get("submitted_case")
         if isinstance(panel, dict) and isinstance(case_data, dict):
+            st.caption("Download this review")
+            report = case_pdf_bytes(panel, case_data)
+            if report is not None:
+                st.download_button(
+                    "Case review (PDF)",
+                    report,
+                    file_name=f"{export_stem(case_data)}-review.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    help="Printable report to keep, or to hand to a lawyer or union.",
+                )
             export = json.dumps(
                 {"caseData": case_data, "panel": panel}, ensure_ascii=False, indent=2
             )
             st.download_button(
-                "Download case export",
+                "Full record (JSON)",
                 export,
-                file_name="mariner-advocate-case.json",
+                file_name=f"{export_stem(case_data)}-record.json",
                 mime="application/json",
                 use_container_width=True,
             )
@@ -963,6 +1012,18 @@ def render_overview(panel: dict[str, Any]) -> None:
     metric_a.metric("Overall confidence", str(arbitration.get("overallConfidence") or "unclear").title())
     metric_b.metric("Recommended actions", len(safe_list(arbitration.get("recommendedActions"))))
     metric_c.metric("Open questions", len(safe_list(arbitration.get("unresolvedQuestions"))))
+
+    case_data = st.session_state.get("submitted_case")
+    if isinstance(case_data, dict):
+        report = case_pdf_bytes(panel, case_data)
+        if report is not None:
+            st.download_button(
+                "Download this review as a PDF",
+                report,
+                file_name=f"{export_stem(case_data)}-review.pdf",
+                mime="application/pdf",
+                help="Includes the coverage notes, evidence checklist, and case facts.",
+            )
 
     st.subheader("What to do next")
     actions = safe_list(arbitration.get("recommendedActions"))
@@ -1276,12 +1337,32 @@ def render_documents(panel: dict[str, Any], case_data: dict[str, Any], config: P
         height=520,
         key=f"draft_text_{hashlib.sha256(title.encode('utf-8')).hexdigest()[:10]}",
     )
-    st.download_button(
-        "Download draft as .txt",
-        draft_text,
-        file_name=f"{slug(title)}.txt",
-        mime="text/plain",
-    )
+    # Export what the user is actually looking at, including any edits they made
+    # in the box above, rather than the model's original wording.
+    edited = dict(draft)
+    edited["documentText"] = draft_text
+    pdf_column, text_column = st.columns(2)
+    try:
+        with pdf_column:
+            st.download_button(
+                "Download draft as PDF",
+                build_document_pdf(edited),
+                file_name=f"{slug(title)}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+    except AppError as exc:
+        pdf_column.caption(f"PDF unavailable: {exc}")
+    except Exception:
+        pdf_column.caption("The PDF could not be produced because of an unexpected error.")
+    with text_column:
+        st.download_button(
+            "Download draft as .txt",
+            draft_text,
+            file_name=f"{slug(title)}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
     attachments = safe_list(draft.get("attachmentsChecklist"))
     fields = safe_list(draft.get("fieldsToConfirm"))
     if attachments:
