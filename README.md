@@ -75,16 +75,14 @@ Supported settings:
 | `ANTHROPIC_API_KEY` | none | Blind review and comparison |
 | `ZAI_API_KEY` | none | First analysis |
 | `OPENAI_MODEL` | `gpt-5.6-sol` | OpenAI model ID |
-| `ANTHROPIC_MODEL` | `claude-opus-4-8` | Anthropic model ID |
-| `ZAI_MODEL` | `glm-5.1` | Z.AI model ID |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | Anthropic model ID |
+| `ZAI_MODEL` | `glm-5.3` | Z.AI model ID |
 | `APP_PASSWORD` | none | Basic shared-password gate |
 | `DEMO_MODE` | `false` | Use deterministic fake responses and no APIs |
 | `PUBLIC_DEMO_ONLY` | `false` | Force demo mode and require fictional-data acknowledgment |
 | `REQUEST_TIMEOUT_SECONDS` | `420` | Provider request timeout, bounded to 60-900 seconds |
 
-The requested name "GLM 5.3" was not listed in Z.AI's official API documentation
-when the initial MVP was built. If your Z.AI account exposes that exact model, set
-`ZAI_MODEL` to the model ID shown in your provider console.
+The defaults use Anthropic's `claude-opus-5` and Z.AI's `glm-5.3` model IDs.
 
 OpenAI's official model documentation identifies `gpt-5.6-sol` as the frontier model
 for complex work and documents `reasoning.mode: "pro"` on the Responses API:

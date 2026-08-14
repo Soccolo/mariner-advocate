@@ -276,9 +276,9 @@ def build_config() -> ProviderConfig:
         zai_key=str(get_setting("ZAI_API_KEY", "") or ""),
         openai_model=str(get_setting("OPENAI_MODEL", "gpt-5.6-sol") or "gpt-5.6-sol"),
         anthropic_model=str(
-            get_setting("ANTHROPIC_MODEL", "claude-opus-4-8") or "claude-opus-4-8"
+            get_setting("ANTHROPIC_MODEL", "claude-opus-5") or "claude-opus-5"
         ),
-        zai_model=str(get_setting("ZAI_MODEL", "glm-5.1") or "glm-5.1"),
+        zai_model=str(get_setting("ZAI_MODEL", "glm-5.3") or "glm-5.3"),
         demo_mode=DEMO_MODE,
         timeout_seconds=max(60, min(timeout, 900)),
     )

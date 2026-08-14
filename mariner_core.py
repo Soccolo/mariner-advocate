@@ -30,8 +30,8 @@ class ProviderConfig:
     anthropic_key: str = ""
     zai_key: str = ""
     openai_model: str = "gpt-5.6-sol"
-    anthropic_model: str = "claude-opus-4-8"
-    zai_model: str = "glm-5.1"
+    anthropic_model: str = "claude-opus-5"
+    zai_model: str = "glm-5.3"
     demo_mode: bool = False
     timeout_seconds: int = 420
 
