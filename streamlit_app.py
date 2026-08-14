@@ -8,6 +8,7 @@ import json
 import os
 import re
 import zipfile
+from dataclasses import fields
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -320,22 +321,49 @@ def build_config() -> ProviderConfig:
     effort = str(get_setting("ANTHROPIC_EFFORT", "high") or "high").strip().lower()
     if effort not in {"low", "medium", "high", "xhigh", "max"}:
         effort = "high"
-    return ProviderConfig(
-        openai_key=str(get_setting("OPENAI_API_KEY", "") or ""),
-        anthropic_key=str(get_setting("ANTHROPIC_API_KEY", "") or ""),
-        zai_key=str(get_setting("ZAI_API_KEY", "") or ""),
-        openai_model=str(get_setting("OPENAI_MODEL", "gpt-5.6-sol") or "gpt-5.6-sol"),
-        anthropic_model=str(
+    settings: dict[str, Any] = {
+        "openai_key": str(get_setting("OPENAI_API_KEY", "") or ""),
+        "anthropic_key": str(get_setting("ANTHROPIC_API_KEY", "") or ""),
+        "zai_key": str(get_setting("ZAI_API_KEY", "") or ""),
+        "openai_model": str(get_setting("OPENAI_MODEL", "gpt-5.6-sol") or "gpt-5.6-sol"),
+        "anthropic_model": str(
             get_setting("ANTHROPIC_MODEL", "claude-opus-5") or "claude-opus-5"
         ),
-        zai_model=str(get_setting("ZAI_MODEL", "glm-5.3") or "glm-5.3"),
-        demo_mode=DEMO_MODE,
-        timeout_seconds=max(60, min(timeout, 900)),
-        anthropic_max_tokens=int_setting(
+        "zai_model": str(get_setting("ZAI_MODEL", "glm-5.3") or "glm-5.3"),
+        "demo_mode": DEMO_MODE,
+        "timeout_seconds": max(60, min(timeout, 900)),
+        "anthropic_max_tokens": int_setting(
             "ANTHROPIC_MAX_TOKENS", 32_000, low=4_000, high=128_000
         ),
-        anthropic_effort=effort,
-        zai_max_tokens=int_setting("ZAI_MAX_TOKENS", 32_000, low=4_000, high=128_000),
+        "anthropic_effort": effort,
+        "zai_max_tokens": int_setting(
+            "ZAI_MAX_TOKENS", 32_000, low=4_000, high=128_000
+        ),
+    }
+
+    # Streamlit re-executes this script on every rerun but keeps imported
+    # modules in sys.modules, so a redeployed app can run a new page against a
+    # mariner_core left over from the previous version. Passing a setting that
+    # older core does not define raises a TypeError that Streamlit Cloud
+    # redacts, which is close to undiagnosable. Detect the mismatch instead and
+    # tell the operator the one thing that fixes it.
+    supported = {field.name for field in fields(ProviderConfig)}
+    st.session_state.stale_core_settings = sorted(set(settings) - supported)
+    return ProviderConfig(
+        **{key: value for key, value in settings.items() if key in supported}
+    )
+
+
+def render_stale_core_notice() -> None:
+    stale = st.session_state.get("stale_core_settings") or []
+    if not stale:
+        return
+    st.error(
+        "This app is running a newer page against an older copy of `mariner_core.py` "
+        "still loaded in memory, so these settings were ignored: "
+        + ", ".join(stale)
+        + ". Provider fixes that depend on them are **not active**. Reboot the app "
+        "(Manage app → ⋮ → Reboot app) to load the current code."
     )
 
 
@@ -709,10 +737,18 @@ def render_sidebar(config: ProviderConfig) -> None:
                 st.write(f"{'✅' if ready else '❌'} {name}")
         st.divider()
         st.caption("Configured models")
+
+        def budget(name: str) -> str:
+            # Tolerate a stale mariner_core still held in memory after a redeploy;
+            # render_stale_core_notice explains the mismatch in the main column.
+            value = getattr(config, name, None)
+            return f"{value:,}" if isinstance(value, int) else "unknown"
+
+        effort = getattr(config, "anthropic_effort", "unknown")
         st.code(
-            f"Z.AI: {config.zai_model} (max {config.zai_max_tokens:,} out)\n"
+            f"Z.AI: {config.zai_model} (max {budget('zai_max_tokens')} out)\n"
             f"Claude: {config.anthropic_model} "
-            f"({config.anthropic_effort} effort, max {config.anthropic_max_tokens:,} out)\n"
+            f"({effort} effort, max {budget('anthropic_max_tokens')} out)\n"
             f"OpenAI: {config.openai_model}",
             language=None,
         )
@@ -1482,6 +1518,7 @@ def main() -> None:
     st.html(STATIC_CSS)
     render_sidebar(config)
     render_header()
+    render_stale_core_notice()
     if not PUBLIC_DEMO_ONLY and not config.demo_mode and not str(get_setting("APP_PASSWORD", "") or ""):
         st.error(
             "Live mode is locked because APP_PASSWORD is not configured. Add a long random "
