@@ -21,7 +21,10 @@ Live mode fails closed before case intake when `APP_PASSWORD` is missing.
 
 This project has no database. Case details and results live in a Streamlit session
 until that session ends, but live requests send the submitted facts to Z.AI,
-Anthropic, and OpenAI. If the user explicitly runs contract import, locally extracted
+Anthropic, and OpenAI. A downloaded PDF contains the case facts and the panel's
+conclusions in one file, so treat it as sensitive: it is exactly what a lawyer or
+union needs, and exactly what should not be left on a shared machine or emailed
+unencrypted. If the user explicitly runs contract import, locally extracted
 contract text is sent to OpenAI to populate contract-related intake fields.
 
 ## Review workflow
@@ -37,6 +40,24 @@ contract text is sent to OpenAI to populate contract-related intake fields.
 6. OpenAI can draft a notification, payment request, evidence-preservation request,
    complaint, or chronology from the arbitrated record.
 7. A follow-up workspace discusses the next required steps using that same record.
+8. The review and any draft can be downloaded as PDFs to print, keep, or hand to a
+   lawyer or union representative.
+
+## Downloads
+
+| Download | Where | Contents |
+|---|---|---|
+| Case review (PDF) | Sidebar and the **Overview** tab | Coverage notes, executive summary, next steps, possible rights, disputes, questions to answer, evidence checklist, sources, each model's analysis, the follow-up discussion, and the case as submitted |
+| Draft (PDF or .txt) | **Documents** tab | The draft as currently edited on screen, plus its attachment and confirmation checklists |
+| Full record (JSON) | Sidebar | The complete panel structure for archiving or re-import |
+
+PDFs are generated locally with `fpdf2`; nothing is uploaded to produce them. Every
+page repeats that the document is decision support rather than legal advice, and a
+reduced-coverage review says so on the page, so a printed copy cannot hide that a
+stage failed or was cut short. Text is drawn with the DejaVu face bundled in
+`assets/` — the PDF core fonts cannot represent Romanian s-comma or t-comma, so a
+core-font export would silently corrupt drafted wording. The font is redistributed
+under the Bitstream Vera licence in `assets/LICENSE-DejaVu.txt`.
 
 Provider stages are isolated. If Z.AI or either Claude stage fails or returns invalid
 JSON, successful stages are preserved. When at least one independent analysis exists,
