@@ -61,6 +61,8 @@ class ProviderConfig:
     anthropic_effort: str = "high"
     # GLM reasoning is billed from the same output allowance as the final JSON.
     zai_max_tokens: int = 32_000
+    # Senior arbitration reasons at high effort; the allowance covers that too.
+    openai_max_output_tokens: int = 32_000
 
 
 OFFICIAL_SOURCE_PACK = """
@@ -414,6 +416,8 @@ _DIAGNOSTIC_LABELS = {
     "providerErrorCode": "provider error code",
     "stopReason": "stop reason",
     "finishReason": "finish reason",
+    "status": "response status",
+    "incompleteReason": "incomplete because",
     "timeoutSeconds": "timeout (seconds)",
     "networkError": "network error",
     "streamError": "stream error",
@@ -478,6 +482,9 @@ def _provider_failure(
     elif "could not reach" in raw:
         error_type = "network"
         message = f"{provider} could not be reached from the app server."
+    elif "stopped sending" in raw:
+        error_type = "network"
+        message = f"{provider} disconnected before finishing its response."
     else:
         error_type = "unexpected_error"
         message = f"{provider} could not complete this stage."
@@ -574,6 +581,33 @@ def _provider_post(
             diagnostics=_request_diagnostics(status=response.status_code),
         )
     return data
+
+
+# Markers that identify a rejected request *parameter*, so the caller can retry
+# without the optional field instead of failing the whole stage.
+_UNSUPPORTED_PARAMETER_MARKERS = (
+    "output_config",
+    "output config",
+    "json_schema",
+    "schema",
+    "effort",
+    "thinking",
+    "unsupported",
+    "unrecognized",
+    "unknown field",
+    "unexpected keyword",
+    "extra inputs",
+    "not supported",
+    "not permitted",
+)
+
+
+def _is_unsupported_parameter_error(error: AppError) -> bool:
+    status = error.diagnostics.get("httpStatus")
+    if status not in (400, 404, 422):
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in _UNSUPPORTED_PARAMETER_MARKERS)
 
 
 def _extract_openai_text(data: dict[str, Any]) -> str:
@@ -767,58 +801,230 @@ def salvage_truncated_json(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _call_openai(prompt: str, config: ProviderConfig, *, senior: bool) -> dict[str, Any]:
-    reasoning: dict[str, str] = {"effort": "high" if senior else "medium"}
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+
+
+def _openai_headers(config: ProviderConfig) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.openai_key}",
+    }
+
+
+def _openai_request_variants(
+    prompt: str, config: ProviderConfig, *, senior: bool
+) -> list[dict[str, Any]]:
+    """Build the arbitration request, most capable first, then plainer.
+
+    Pro mode and the verbosity control are the settings most likely to be
+    unavailable on a given model or account. Dropping them one at a time keeps a
+    degraded synthesis available instead of losing the stage outright.
+    """
+    base: dict[str, Any] = {
+        "model": config.openai_model,
+        "input": prompt,
+        "max_output_tokens": max(4_000, int(config.openai_max_output_tokens or 0)),
+        "store": False,
+    }
+    effort = {"effort": "high" if senior else "medium"}
+    variants: list[dict[str, Any]] = []
     if senior:
-        reasoning["mode"] = "pro"
-    data = _provider_post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.openai_key}",
-        },
-        body={
-            "model": config.openai_model,
-            "input": prompt,
-            "reasoning": reasoning,
-            "text": {"verbosity": "medium"},
-            "store": False,
-        },
-        label="OpenAI",
-        timeout_seconds=config.timeout_seconds,
-    )
-    return parse_model_json(_extract_openai_text(data), "OpenAI")
+        variants.append(
+            {**base, "reasoning": {**effort, "mode": "pro"}, "text": {"verbosity": "medium"}}
+        )
+    variants.append({**base, "reasoning": effort, "text": {"verbosity": "medium"}})
+    variants.append({**base, "reasoning": effort})
+    variants.append(dict(base))
+    return variants
+
+
+def _openai_refused(response: Any) -> bool:
+    for item in _mapping_get(response, "output"):
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "refusal":
+                return True
+    return False
+
+
+def _mapping_get(value: Any, key: str) -> list[Any]:
+    if not isinstance(value, dict):
+        return []
+    items = value.get(key)
+    return items if isinstance(items, list) else []
+
+
+def _openai_result(response: Any, text: str) -> dict[str, Any]:
+    payload = response if isinstance(response, dict) else {}
+    incomplete = payload.get("incomplete_details")
+    reason = ""
+    if isinstance(incomplete, dict):
+        reason = str(incomplete.get("reason") or "")
+    return {
+        "text": text or _extract_openai_text(payload),
+        "status": str(payload.get("status") or ""),
+        "incompleteReason": reason,
+        "refused": _openai_refused(payload),
+    }
+
+
+def _openai_message(
+    body: dict[str, Any], config: ProviderConfig, *, stream: bool, label: str = "OpenAI"
+) -> dict[str, Any]:
+    """Call the Responses API, streaming unless the caller opted out.
+
+    Senior arbitration runs at high reasoning effort and can take many minutes.
+    A single non-streaming request has to complete inside one HTTP timeout; a
+    stream only has to keep sending, so the timeout applies between chunks.
+    """
+    if not stream:
+        data = _provider_post(
+            OPENAI_RESPONSES_URL,
+            headers=_openai_headers(config),
+            body=body,
+            label=label,
+            timeout_seconds=config.timeout_seconds,
+        )
+        return _openai_result(data, _extract_openai_text(data))
+
+    try:
+        response = requests.post(
+            OPENAI_RESPONSES_URL,
+            headers={**_openai_headers(config), "Accept": "text/event-stream"},
+            json={**body, "stream": True},
+            timeout=config.timeout_seconds,
+            stream=True,
+        )
+    except requests.Timeout as exc:
+        raise AppError(
+            f"{label} request timed out. Try again in a moment.",
+            diagnostics={"timeoutSeconds": config.timeout_seconds},
+        ) from exc
+    except requests.RequestException as exc:
+        raise AppError(
+            f"Could not reach {label}. Check the provider status and try again.",
+            diagnostics={"networkError": type(exc).__name__},
+        ) from exc
+
+    text_parts: list[str] = []
+    final_response: dict[str, Any] = {}
+    stream_error: dict[str, Any] | None = None
+    with response:
+        if not response.ok:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            message = _safe_provider_message(data, f"HTTP {response.status_code}")
+            raise AppError(
+                f"{label} request failed: {message}",
+                diagnostics=_request_diagnostics(status=response.status_code, data=data),
+            )
+
+        try:
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", "replace")
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[len("data:") :].strip()
+                if not chunk or chunk == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(chunk)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = str(event.get("type") or "")
+                if event_type == "response.output_text.delta":
+                    text_parts.append(str(event.get("delta") or ""))
+                elif event_type in (
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                ):
+                    if isinstance(event.get("response"), dict):
+                        final_response = event["response"]
+                elif event_type == "error":
+                    stream_error = event
+        except requests.RequestException as exc:
+            raise AppError(
+                f"{label} stopped sending its response before it finished.",
+                diagnostics={"streamError": type(exc).__name__},
+            ) from exc
+
+    if stream_error is not None:
+        raise AppError(
+            f"{label} request failed: "
+            f"{_safe_provider_message(stream_error, 'the response stream reported an error')}",
+            diagnostics=_request_diagnostics(data=stream_error, streamFailed=True),
+        )
+    return _openai_result(final_response, "".join(text_parts))
+
+
+def _call_openai(prompt: str, config: ProviderConfig, *, senior: bool) -> dict[str, Any]:
+    variants = _openai_request_variants(prompt, config, senior=senior)
+    stream = True
+    last_error: AppError | None = None
+    index = 0
+    while index < len(variants):
+        body = variants[index]
+        try:
+            result = _openai_message(body, config, stream=stream)
+        except AppError as error:
+            last_error = error
+            # A deployment that blocks streamed responses should fall back to a
+            # single request rather than lose arbitration entirely.
+            if stream and "stream" in str(error).lower() and _is_unsupported_parameter_error(error):
+                stream = False
+                continue
+            if index + 1 < len(variants) and _is_unsupported_parameter_error(error):
+                index += 1
+                continue
+            raise
+
+        status = result["status"]
+        reason = result["incompleteReason"]
+        text = str(result["text"] or "")
+        if result["refused"]:
+            raise AppError(
+                "OpenAI declined to answer this request. Rephrase the case facts or "
+                "rely on the other configured providers.",
+                diagnostics={"status": status or "refusal"},
+            )
+        if not text.strip():
+            if reason == "max_output_tokens":
+                raise AppError(
+                    "OpenAI used its whole output allowance before writing an answer. "
+                    "Raise OPENAI_MAX_OUTPUT_TOKENS.",
+                    diagnostics={"status": status, "incompleteReason": reason},
+                )
+            raise AppError(
+                f"OpenAI returned no final content (status: {status or 'unknown'}).",
+                diagnostics={"status": status, "incompleteReason": reason},
+            )
+
+        try:
+            return parse_model_json(text, "OpenAI")
+        except AppError as error:
+            if reason == "max_output_tokens" or status == "incomplete":
+                recovered = salvage_truncated_json(text)
+                if recovered is not None:
+                    return recovered
+                raise AppError(
+                    "OpenAI returned truncated JSON. Raise OPENAI_MAX_OUTPUT_TOKENS.",
+                    diagnostics={"status": status, "incompleteReason": reason},
+                ) from error
+            raise
+
+    raise last_error or AppError("OpenAI could not complete this stage.")
 
 
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-
-# Markers that identify a rejected request *parameter*, so the caller can retry
-# without the optional field instead of failing the whole stage.
-_UNSUPPORTED_PARAMETER_MARKERS = (
-    "output_config",
-    "output config",
-    "json_schema",
-    "schema",
-    "effort",
-    "thinking",
-    "unsupported",
-    "unrecognized",
-    "unknown field",
-    "unexpected keyword",
-    "extra inputs",
-    "not supported",
-    "not permitted",
-)
-
-
-def _is_unsupported_parameter_error(error: AppError) -> bool:
-    status = error.diagnostics.get("httpStatus")
-    if status not in (400, 404, 422):
-        return False
-    message = str(error).lower()
-    return any(marker in message for marker in _UNSUPPORTED_PARAMETER_MARKERS)
-
 
 def _anthropic_stream(
     body: dict[str, Any], config: ProviderConfig, *, label: str = "Anthropic"
@@ -1399,6 +1605,14 @@ def analyze_case(
                 arbitration_result, first, independent, critique
             )
             stage_status["arbitration"] = "completed"
+            warning = _truncation_warning(
+                stage="arbitration",
+                provider="OpenAI",
+                model=config.openai_model,
+                result=arbitration,
+            )
+            if warning:
+                provider_warnings.append(warning)
         except Exception as error:
             stage_status["arbitration"] = "failed"
             provider_failures.append(
