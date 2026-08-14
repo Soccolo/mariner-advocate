@@ -16,7 +16,12 @@ from streamlit.testing.v1 import AppTest
 
 import mariner_core
 
-NEW_SETTINGS = ("anthropic_max_tokens", "anthropic_effort", "zai_max_tokens")
+NEW_SETTINGS = (
+    "anthropic_max_tokens",
+    "anthropic_effort",
+    "zai_max_tokens",
+    "openai_max_output_tokens",
+)
 
 PreviousProviderConfig = dataclasses.make_dataclass(
     "ProviderConfig",

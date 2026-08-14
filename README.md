@@ -248,8 +248,14 @@ python -c "from mariner_core import ProviderConfig, analyze_case; c={'situation'
 streamlit run streamlit_app.py --server.headless true
 ```
 
-The original Node prototype remains in `server.mjs` and `public/`, but
-`streamlit_app.py` is the deployment entry point. The prototype still carries the
-original answer-sized output budgets and non-streaming requests, so it drops
-reasoning-model responses that the Streamlit app now handles. Treat it as historical
-reference, not a second supported entry point.
+### Do not run the Node prototype
+
+`streamlit_app.py` is the only supported entry point. The original Node prototype in
+`server.mjs` and `public/` is unmaintained: it still has the answer-sized output
+budgets and non-streaming requests that made Claude and Z.AI fail, no truncation
+recovery, no provider diagnostics, no PDF export, and an older prompt set.
+
+`npm start` still launches it, which makes it a trap rather than a reference: it will
+send real case facts to the providers and then discard most of the responses. Use
+`streamlit run streamlit_app.py`. The prototype is kept only for history and can be
+deleted without affecting the app.
