@@ -29,49 +29,215 @@ st.set_page_config(
 
 
 STATIC_CSS = """
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
+  /* ---- Industry: steel-blue blueprint on a light technical ground ---- */
   :root {
-    --navy: #102a43;
-    --ocean: #0f766e;
-    --mist: #eff8f6;
-    --sand: #fbf7ef;
+    --bg: #f2f2f3;
+    --surface: #e9e9ea;
+    --ink: #1d1f20;
+    --muted: #5d5d60;
+    --faint: #7a7a7d;
+    --line: rgba(29, 31, 32, .16);
+    --rule: rgba(29, 31, 32, .28);
+    --accent: #5980a6;
+    --accent-deep: #416180;
+    --accent-field: #1d2d3d;
+    --heading: "Barlow Condensed", system-ui, sans-serif;
+    --body: "Barlow", system-ui, sans-serif;
+    /* corner registration marks, drawn as background layers */
+    --mk:
+      linear-gradient(#1d1f208c,#1d1f208c) left -4px top 0/9px 1px no-repeat,
+      linear-gradient(#1d1f208c,#1d1f208c) left 0 top -4px/1px 9px no-repeat,
+      linear-gradient(#1d1f208c,#1d1f208c) right -4px top 0/9px 1px no-repeat,
+      linear-gradient(#1d1f208c,#1d1f208c) right 0 top -4px/1px 9px no-repeat,
+      linear-gradient(#1d1f208c,#1d1f208c) left -4px bottom 0/9px 1px no-repeat,
+      linear-gradient(#1d1f208c,#1d1f208c) left 0 bottom -4px/1px 9px no-repeat,
+      linear-gradient(#1d1f208c,#1d1f208c) right -4px bottom 0/9px 1px no-repeat,
+      linear-gradient(#1d1f208c,#1d1f208c) right 0 bottom -4px/1px 9px no-repeat;
+    --mk-light:
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) left -4px top 0/9px 1px no-repeat,
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) left 0 top -4px/1px 9px no-repeat,
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) right -4px top 0/9px 1px no-repeat,
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) right 0 top -4px/1px 9px no-repeat,
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) left -4px bottom 0/9px 1px no-repeat,
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) left 0 bottom -4px/1px 9px no-repeat,
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) right -4px bottom 0/9px 1px no-repeat,
+      linear-gradient(#f2f2f3a8,#f2f2f3a8) right 0 bottom -4px/1px 9px no-repeat;
   }
-  .stApp { background: linear-gradient(180deg, #fbfcfb 0%, #f4f8f7 100%); }
-  .block-container { max-width: 1500px; padding-top: 2rem; padding-bottom: 4rem; }
+
+  /* ---- ground and type ---- */
+  .stApp { background: var(--bg); }
+  html, body, .stApp, [class*="css"] { font-family: var(--body); color: var(--ink); }
+  .block-container { max-width: 1500px; padding-top: 1.8rem; padding-bottom: 4rem; }
+  h1, h2, h3, h4, h5, h6,
+  .stMarkdown h1, .stMarkdown h2, .stMarkdown h3, .stMarkdown h4 {
+    font-family: var(--heading); font-weight: 600; letter-spacing: -.01em; line-height: 1.08;
+  }
+  .stMarkdown h2, .stMarkdown h3, .stMarkdown h4 { text-transform: uppercase; letter-spacing: .02em; }
+  .stMarkdown p, .stMarkdown li { font-size: 14.5px; line-height: 1.6; }
+  a, a:visited { color: var(--accent-deep); text-underline-offset: 3px; }
+  a:hover { color: #2c455d; }
+  ::selection { background: #d6ebff; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  footer, #MainMenu { visibility: hidden; }
+
+  /* ---- hero: a spec-sheet plate on the paper ground, not a gradient card ---- */
   .hero {
-    padding: 2rem 2.2rem;
-    border-radius: 22px;
-    color: white;
-    background: linear-gradient(125deg, #102a43 0%, #174d55 58%, #0f766e 100%);
-    box-shadow: 0 18px 50px rgba(16, 42, 67, .15);
-    margin-bottom: 1.2rem;
+    position: relative;
+    margin-bottom: .9rem;
+    padding: 1.9rem 2rem;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--ink);
   }
-  .hero .eyebrow { letter-spacing: .12em; font-size: .76rem; font-weight: 700; opacity: .76; }
-  .hero h1 { font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1.04; margin: .45rem 0 .65rem; }
-  .hero p { max-width: 880px; font-size: 1.05rem; opacity: .9; margin: 0; }
+  .hero::before { content: ""; position: absolute; inset: 0; background: var(--mk); pointer-events: none; }
+  .hero .eyebrow {
+    font-family: var(--heading); font-weight: 600; font-size: .72rem;
+    letter-spacing: .16em; text-transform: uppercase; color: var(--accent-deep); opacity: 1;
+  }
+  .hero h1 {
+    font-size: clamp(2.2rem, 3.6vw, 3.5rem); line-height: 1.02;
+    margin: .5rem 0 .6rem; max-width: 22ch; letter-spacing: -.02em;
+  }
+  .hero p { max-width: 74ch; font-size: 1rem; line-height: 1.6; color: #424244; opacity: 1; margin: 0; }
+
+  /* ---- workflow cards: transparent line drawings with corner marks ---- */
   .workflow-card {
-    border: 1px solid #dbe7e4;
-    border-radius: 15px;
-    padding: .9rem 1rem;
-    min-height: 100px;
-    background: rgba(255,255,255,.88);
+    position: relative;
+    border: 1px solid var(--line);
+    border-radius: 0;
+    background: transparent;
+    padding: .95rem 1rem;
+    min-height: 112px;
   }
-  .workflow-card .number { color: #0f766e; font-weight: 800; font-size: .78rem; letter-spacing: .1em; }
-  .workflow-card strong { color: #102a43; display: block; margin: .25rem 0; }
-  .workflow-card small { color: #526777; line-height: 1.4; }
-  [data-testid="stMetricValue"] { color: #0f766e; }
-  div[data-testid="stForm"] { border-color: #dbe7e4; border-radius: 16px; background: rgba(255,255,255,.72); }
+  .workflow-card::before { content: ""; position: absolute; inset: 0; background: var(--mk); pointer-events: none; }
+  .workflow-card .number {
+    font-family: var(--heading); font-weight: 600; font-size: .72rem;
+    letter-spacing: .14em; color: var(--accent-deep);
+  }
+  .workflow-card strong {
+    display: block; margin: .3rem 0 .25rem;
+    font-family: var(--heading); font-weight: 600; font-size: 1.06rem;
+    letter-spacing: .02em; text-transform: uppercase; color: var(--ink);
+  }
+  .workflow-card small { color: var(--muted); font-size: .8rem; line-height: 1.45; }
+
+  /* ---- the waiting plate ---- */
   .case-empty {
-    border: 1px dashed #a9c8c2;
-    border-radius: 18px;
-    padding: 2rem;
+    border: 1px dashed var(--rule);
+    border-radius: 0;
+    background: transparent;
+    padding: 3.4rem 2rem;
     text-align: center;
-    color: #526777;
-    background: rgba(255,255,255,.55);
+    color: var(--muted);
   }
-  .case-empty h3 { color: #102a43; margin-top: .25rem; }
-  .small-note { color: #667b86; font-size: .86rem; }
-  footer { visibility: hidden; }
+  .case-empty h3 {
+    color: var(--ink); margin: .6rem 0 .5rem;
+    font-family: var(--heading); font-size: 1.9rem; text-transform: uppercase;
+  }
+  .small-note { color: var(--faint); font-size: .82rem; }
+
+  /* ---- forms: square-cornered, hairline, surface-filled inputs ---- */
+  div[data-testid="stForm"] {
+    border: 1px solid var(--line); border-radius: 0;
+    background: transparent; padding: 1.2rem 1.3rem;
+  }
+  .stTextInput label, .stTextArea label, .stSelectbox label, .stCheckbox label {
+    font-family: var(--body) !important; font-size: 12px !important; color: #424244 !important;
+  }
+  .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] > div,
+  .stNumberInput input {
+    background: var(--surface) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 4px !important;
+    color: var(--ink) !important;
+    font-family: var(--body) !important;
+  }
+  .stTextInput input:focus, .stTextArea textarea:focus { border-color: var(--accent) !important; box-shadow: none !important; }
+  .stTextInput input::placeholder, .stTextArea textarea::placeholder { color: #98989b !important; }
+
+  /* ---- buttons: the primary is the one solid object on the board ---- */
+  .stButton button, .stDownloadButton button, .stFormSubmitButton button, .stLinkButton a {
+    border-radius: 0 !important;
+    font-family: var(--heading) !important; font-weight: 600 !important;
+    letter-spacing: .07em; text-transform: uppercase;
+    border: 1px solid var(--rule) !important;
+    background: transparent !important; color: var(--ink) !important;
+    transition: background .12s ease;
+  }
+  .stButton button:hover, .stDownloadButton button:hover, .stLinkButton a:hover {
+    background: rgba(29,31,32,.07) !important;
+  }
+  .stFormSubmitButton button[kind="primaryFormSubmit"],
+  .stButton button[kind="primary"] {
+    position: relative;
+    background: var(--accent) !important; border-color: var(--accent) !important;
+    color: var(--bg) !important; padding: .8rem 1.1rem !important; font-size: 1.05rem !important;
+  }
+  .stFormSubmitButton button[kind="primaryFormSubmit"]::before,
+  .stButton button[kind="primary"]::before {
+    content: ""; position: absolute; inset: 0; background: var(--mk-light); pointer-events: none;
+  }
+  .stFormSubmitButton button[kind="primaryFormSubmit"]:hover,
+  .stButton button[kind="primary"]:hover { background: #597ea3 !important; border-color: #597ea3 !important; }
+
+  /* ---- containers, expanders, tabs ---- */
+  div[data-testid="stVerticalBlockBorderWrapper"] > div:has(> div[data-testid="stVerticalBlock"]) { border-radius: 0; }
+  div[data-testid="stExpander"] details {
+    border: 1px solid var(--line) !important; border-radius: 0 !important; background: transparent !important;
+  }
+  div[data-testid="stExpander"] summary p {
+    font-family: var(--heading) !important; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+  }
+  .stTabs [data-baseweb="tab-list"] { gap: 0; border-bottom: 1px solid var(--line); }
+  .stTabs [data-baseweb="tab"] {
+    font-family: var(--heading); font-weight: 600; font-size: .95rem;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--faint);
+    padding: .7rem .9rem; border-radius: 0;
+  }
+  .stTabs [aria-selected="true"] { color: var(--ink); }
+  .stTabs [data-baseweb="tab-highlight"] { background: var(--accent); }
+
+  /* ---- metrics read as spec-sheet numbers ---- */
+  [data-testid="stMetric"] { border: 1px solid var(--line); padding: .8rem .9rem; }
+  [data-testid="stMetricLabel"] p {
+    font-size: 11px !important; letter-spacing: .12em; text-transform: uppercase; color: var(--faint) !important;
+  }
+  [data-testid="stMetricValue"] {
+    color: var(--accent-deep); font-family: var(--heading); font-weight: 600; font-size: 1.9rem;
+  }
+
+  /* ---- callouts: mono palette, one steel edge, no decorative colour ---- */
+  div[data-testid="stAlert"] {
+    border-radius: 0; border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    background: var(--surface); color: #424244;
+  }
+  div[data-testid="stAlert"] p { font-size: 13.5px; line-height: 1.55; }
+  div[data-testid="stAlert"] svg { color: var(--accent-deep); }
+  /* the executive summary st.info reads as the one reversed field */
+  div[data-testid="stAlert"]:has(svg[title="info"]),
+  .exec-field {
+    background: var(--accent-field); color: #f2f2f3; border-color: var(--accent-field);
+    border-left-color: var(--accent);
+  }
+  div[data-testid="stAlert"]:has(svg[title="info"]) p { color: #f2f2f3; font-size: 15px; }
+
+  /* ---- sidebar ---- */
+  section[data-testid="stSidebar"] {
+    background: var(--surface); border-right: 1px solid var(--line);
+  }
+  section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h1 {
+    font-family: var(--heading); text-transform: uppercase; letter-spacing: .04em;
+  }
+  section[data-testid="stSidebar"] .stCode, section[data-testid="stSidebar"] pre {
+    background: transparent !important; border: 1px solid var(--line); border-radius: 0;
+  }
+  hr, div[data-testid="stDivider"] hr { border-color: var(--line); }
+  div[data-testid="stStatusWidget"], div[data-testid="stStatus"] {
+    border-radius: 0 !important; border: 1px solid var(--line) !important;
+  }
 </style>
 """
 
