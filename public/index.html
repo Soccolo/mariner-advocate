@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Independent multi-model legal issue-spotting and document drafting for injured seafarers.">
+  <title>Mariner Advocate</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#top" aria-label="Mariner Advocate home">
+      <span class="brand-mark" aria-hidden="true">M</span>
+      <span>Mariner Advocate</span>
+    </a>
+    <div class="top-actions">
+      <span class="privacy-pill"><span class="dot"></span> Local case workspace</span>
+      <button class="ghost-button" id="exportButton" type="button">Export case</button>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="eyebrow">LEGAL ISSUE-SPOTTING FOR SEAFARERS</div>
+      <h1>A clearer path through a difficult moment.</h1>
+      <p>Describe the incident once. Three independent AI roles examine the facts, surface disagreements, and turn the result into practical next steps and careful document drafts.</p>
+      <div class="safety-note">
+        <strong>Important:</strong> This tool supports—not replaces—a qualified maritime lawyer, union representative, insurer, or emergency medical team. Do not delay treatment.
+      </div>
+    </section>
+
+    <section class="workflow" aria-label="Review workflow">
+      <div class="workflow-step"><span>01</span><div><strong>Independent analysis</strong><small>Z.AI reviews facts and possible legal routes</small></div></div>
+      <div class="workflow-line"></div>
+      <div class="workflow-step"><span>02</span><div><strong>Blind cross-check</strong><small>Claude forms its own view before seeing AI 1</small></div></div>
+      <div class="workflow-line"></div>
+      <div class="workflow-step"><span>03</span><div><strong>Senior arbitration</strong><small>OpenAI resolves supported disputes and flags gaps</small></div></div>
+    </section>
+
+    <div class="app-grid">
+      <form class="case-panel" id="caseForm">
+        <div class="panel-heading">
+          <div><span class="section-number">01</span><h2>Case intake</h2></div>
+          <span class="autosave" id="saveStatus">Saved locally</span>
+        </div>
+
+        <label class="field wide">
+          <span>What happened? <b>*</b></span>
+          <textarea name="situation" rows="8" required placeholder="Describe the incident in chronological order: what happened, where your family member was, what work was underway, the injury, the medical response, and what the company has said so far."></textarea>
+          <small>Write facts you know. Mark uncertain details as uncertain.</small>
+        </label>
+
+        <div class="mini-heading">Vessel & employment</div>
+        <div class="field-grid">
+          <label class="field"><span>Ship name</span><input name="shipName" autocomplete="off" placeholder="e.g. MV …"></label>
+          <label class="field"><span>IMO number</span><input name="imoNumber" inputmode="numeric" autocomplete="off" placeholder="7 digits"></label>
+          <label class="field"><span>Flag state <em>High priority</em></span><input name="flagState" autocomplete="off" placeholder="Country of registry"></label>
+          <label class="field"><span>Role on board</span><input name="role" autocomplete="off" placeholder="e.g. Chief Engineer"></label>
+          <label class="field"><span>Employer / crewing agency</span><input name="employer" autocomplete="organization" placeholder="Company named in contract"></label>
+          <label class="field"><span>Shipowner / operator</span><input name="shipowner" autocomplete="organization" placeholder="If different"></label>
+        </div>
+
+        <div class="mini-heading">Incident & treatment</div>
+        <div class="field-grid">
+          <label class="field"><span>Incident date & time</span><input name="incidentDate" autocomplete="off" placeholder="Include timezone if known"></label>
+          <label class="field"><span>Location / port / waters</span><input name="incidentLocation" autocomplete="off" placeholder="Ship location or hospital city"></label>
+          <label class="field wide"><span>Injury & current treatment</span><textarea name="medicalStatus" rows="4" placeholder="Diagnosis stated by clinicians, surgery status, expected recovery—no speculation."></textarea></label>
+        </div>
+
+        <div class="mini-heading">Documents & communications</div>
+        <div class="field-grid">
+          <label class="field wide"><span>Employment agreement / CBA</span><textarea name="contractTerms" rows="3" placeholder="Paste relevant clauses or note which documents you have."></textarea></label>
+          <label class="field wide"><span>Incident report & evidence</span><textarea name="evidence" rows="3" placeholder="Logbook, witness names, CCTV, photos, weather, risk assessment, medical report, receipts."></textarea></label>
+          <label class="field wide"><span>What has the company or insurer said?</span><textarea name="communications" rows="3" placeholder="Paste exact wording where possible. Include dates and who said it."></textarea></label>
+          <label class="field wide"><span>Desired outcome</span><textarea name="desiredOutcome" rows="2" placeholder="Medical payment, sick wages, repatriation, disability benefit, evidence, formal complaint…"></textarea></label>
+        </div>
+
+        <details class="privacy-details">
+          <summary>Privacy checklist before you submit</summary>
+          <p>Remove passport numbers, banking details, full home addresses, account passwords, and unrelated medical history. Only share what is necessary for the analysis.</p>
+        </details>
+
+        <div class="run-box">
+          <div>
+            <strong>Run the legal review panel</strong>
+            <small id="providerSummary">Checking provider configuration…</small>
+          </div>
+          <button class="primary-button" id="analyzeButton" type="submit">Begin review <span>→</span></button>
+        </div>
+      </form>
+
+      <section class="results-panel" id="resultsPanel" aria-live="polite">
+        <div class="empty-state" id="emptyState">
+          <div class="compass" aria-hidden="true"><span>✦</span></div>
+          <div class="eyebrow">YOUR REVIEW WILL APPEAR HERE</div>
+          <h2>From uncertain facts to a documented plan</h2>
+          <p>The panel will separate confirmed facts from assumptions, identify missing evidence, compare legal views, and propose documents without pretending uncertainty is certainty.</p>
+          <ul>
+            <li>Urgent actions and evidence preservation</li>
+            <li>Possible medical, wage and disability routes</li>
+            <li>Visible disagreements between reviewers</li>
+            <li>Draft-ready document plan</li>
+          </ul>
+        </div>
+
+        <div class="loading-state hidden" id="loadingState">
+          <div class="loading-orbit"><span></span><span></span><span></span></div>
+          <div class="eyebrow">PANEL IN SESSION</div>
+          <h2 id="loadingTitle">Two independent reviews are underway</h2>
+          <p id="loadingText">The reviewer is not being shown the first opinion yet.</p>
+          <div class="progress-track"><div id="progressBar"></div></div>
+          <div class="stage-list">
+            <div class="stage active" data-stage="1"><i></i><span>Independent analyses</span></div>
+            <div class="stage" data-stage="2"><i></i><span>Comparison & dispute map</span></div>
+            <div class="stage" data-stage="3"><i></i><span>Senior arbitration</span></div>
+          </div>
+        </div>
+
+        <div class="results hidden" id="results">
+          <div class="results-header">
+            <div><div class="eyebrow">ARBITRATED CASE REVIEW</div><h2 id="resultTitle">Your action plan</h2></div>
+            <span class="confidence" id="confidenceBadge">Confidence: —</span>
+          </div>
+          <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="overview" type="button">Overview</button>
+            <button class="tab" data-tab="disputes" type="button">Disputes</button>
+            <button class="tab" data-tab="evidence" type="button">Evidence</button>
+            <button class="tab" data-tab="documents" type="button">Documents</button>
+          </div>
+          <div id="resultContent"></div>
+        </div>
+
+        <div class="error-state hidden" id="errorState">
+          <div class="error-icon">!</div>
+          <h2>The panel could not finish</h2>
+          <p id="errorMessage"></p>
+          <button class="secondary-button" id="retryButton" type="button">Try again</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer>
+    <span>Mariner Advocate · Decision support, not legal representation</span>
+    <span>Case data stays in this browser except when sent to configured AI providers.</span>
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
