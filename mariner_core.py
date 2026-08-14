@@ -253,6 +253,46 @@ def _extract_openai_text(data: dict[str, Any]) -> str:
     return "\n".join(text_parts)
 
 
+def _provider_content_text(value: Any) -> str:
+    """Normalize provider content without relying on Python's non-JSON repr."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("text", "content", "value"):
+            if key in value:
+                extracted = _provider_content_text(value[key])
+                if extracted:
+                    return extracted
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "\n".join(
+            part for item in value if (part := _provider_content_text(item)).strip()
+        )
+    return ""
+
+
+def _extract_zai_text(data: dict[str, Any]) -> tuple[str, str]:
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return "", "unknown"
+    choice = choices[0]
+    finish_reason = str(choice.get("finish_reason") or "unknown")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return "", finish_reason
+
+    content = _provider_content_text(message.get("content")).strip()
+    if content:
+        return content, finish_reason
+
+    # Some OpenAI-compatible Z.AI responses put all generated text in the
+    # reasoning field. Use it only when final content is absent.
+    reasoning = _provider_content_text(message.get("reasoning_content")).strip()
+    return reasoning, finish_reason
+
+
 def parse_model_json(text: str, label: str) -> dict[str, Any]:
     cleaned = str(text or "").strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
@@ -333,14 +373,24 @@ def _call_zai(prompt: str, config: ProviderConfig) -> dict[str, Any]:
             "thinking": {"type": "enabled"},
             "max_tokens": 12_000,
             "temperature": 0.2,
+            "stream": False,
+            "response_format": {"type": "json_object"},
         },
         label="Z.AI",
         timeout_seconds=config.timeout_seconds,
     )
-    choices = data.get("choices") or []
-    message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
-    text = message.get("content") if isinstance(message, dict) else ""
-    return parse_model_json(str(text or ""), "Z.AI")
+    text, finish_reason = _extract_zai_text(data)
+    if not text:
+        if finish_reason == "length":
+            raise AppError(
+                "Z.AI used its output budget before returning the final JSON. "
+                "Try a shorter case description or increase the configured request limit."
+            )
+        raise AppError(
+            f"Z.AI returned no final content (finish reason: {finish_reason}). "
+            "Try again or check the configured Z.AI model."
+        )
+    return parse_model_json(text, "Z.AI")
 
 
 def call_provider(
