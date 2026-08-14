@@ -302,11 +302,22 @@ CASE_DATA_KEYS = (
 )
 
 
+def int_setting(name: str, default: int, *, low: int, high: int) -> int:
+    try:
+        value = int(get_setting(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
 def build_config() -> ProviderConfig:
     try:
         timeout = int(get_setting("REQUEST_TIMEOUT_SECONDS", 420))
     except (TypeError, ValueError):
         timeout = 420
+    effort = str(get_setting("ANTHROPIC_EFFORT", "high") or "high").strip().lower()
+    if effort not in {"low", "medium", "high", "xhigh", "max"}:
+        effort = "high"
     return ProviderConfig(
         openai_key=str(get_setting("OPENAI_API_KEY", "") or ""),
         anthropic_key=str(get_setting("ANTHROPIC_API_KEY", "") or ""),
@@ -318,6 +329,11 @@ def build_config() -> ProviderConfig:
         zai_model=str(get_setting("ZAI_MODEL", "glm-5.3") or "glm-5.3"),
         demo_mode=DEMO_MODE,
         timeout_seconds=max(60, min(timeout, 900)),
+        anthropic_max_tokens=int_setting(
+            "ANTHROPIC_MAX_TOKENS", 32_000, low=4_000, high=128_000
+        ),
+        anthropic_effort=effort,
+        zai_max_tokens=int_setting("ZAI_MAX_TOKENS", 32_000, low=4_000, high=128_000),
     )
 
 
@@ -656,7 +672,10 @@ def render_sidebar(config: ProviderConfig) -> None:
         st.divider()
         st.caption("Configured models")
         st.code(
-            f"Z.AI: {config.zai_model}\nClaude: {config.anthropic_model}\nOpenAI: {config.openai_model}",
+            f"Z.AI: {config.zai_model} (max {config.zai_max_tokens:,} out)\n"
+            f"Claude: {config.anthropic_model} "
+            f"({config.anthropic_effort} effort, max {config.anthropic_max_tokens:,} out)\n"
+            f"OpenAI: {config.openai_model}",
             language=None,
         )
 
@@ -907,10 +926,16 @@ def render_intake(config: ProviderConfig) -> None:
         st.session_state.pop("draft", None)
         st.session_state.pop("discussion", None)
         failures = safe_list(panel.get("providerFailures"))
-        if workflow_status == "degraded":
+        warnings = safe_list(panel.get("providerWarnings"))
+        if workflow_status == "degraded" and failures:
             st.warning(
                 f"Review finished with reduced coverage: {len(failures)} provider stage(s) "
                 "were unavailable. The available models continued."
+            )
+        elif workflow_status == "degraded":
+            st.warning(
+                f"Review finished with reduced coverage: {len(warnings)} provider stage(s) "
+                "were cut short by their output limit and only partly recovered."
             )
         elif workflow_status == "partial":
             st.error("Senior arbitration failed. Any completed earlier analyses were preserved.")
@@ -980,12 +1005,18 @@ def render_overview(panel: dict[str, Any]) -> None:
 
 def render_panel_health(panel: dict[str, Any]) -> None:
     failures = safe_list(panel.get("providerFailures"))
-    if not failures:
+    warnings = safe_list(panel.get("providerWarnings"))
+    if not failures and not warnings:
         return
 
     workflow = panel.get("workflow") or {}
     status = str(workflow.get("status") or "degraded")
-    if status == "degraded":
+    if status == "degraded" and not failures:
+        st.warning(
+            "Reduced panel coverage: a provider ran out of output allowance mid-answer. "
+            "The recovered part of its response was used; later sections are missing."
+        )
+    elif status == "degraded":
         st.warning(
             "Reduced panel coverage: at least one provider stage failed, but the available "
             "models continued and OpenAI completed a confidence-limited synthesis."
@@ -1005,14 +1036,19 @@ def render_panel_health(panel: dict[str, Any]) -> None:
         "arbitration": "OpenAI senior arbitration",
     }
     with st.expander("Provider status details"):
-        for failure in failures:
-            if not isinstance(failure, dict):
+        for entry in list(failures) + list(warnings):
+            if not isinstance(entry, dict):
                 continue
-            stage = str(failure.get("stage") or "provider stage")
-            model = str(failure.get("model") or "unknown model")
-            message = str(failure.get("message") or "No usable response was returned.")
+            stage = str(entry.get("stage") or "provider stage")
+            model = str(entry.get("model") or "unknown model")
+            message = str(entry.get("message") or "No usable response was returned.")
             st.markdown(f"**{stage_labels.get(stage, stage)} · {model}**")
             st.caption(message)
+            detail = str(entry.get("detail") or "")
+            error_type = str(entry.get("errorType") or "")
+            technical = " · ".join(part for part in [error_type, detail] if part)
+            if technical:
+                st.code(technical, language=None)
 
 
 def render_available_analyses(panel: dict[str, Any]) -> None:
@@ -1027,6 +1063,11 @@ def render_available_analyses(panel: dict[str, Any]) -> None:
         if not isinstance(result, dict):
             st.warning("This stage was unavailable. Other completed provider results were preserved.")
             continue
+        if result.get("responseTruncated"):
+            st.warning(
+                "This model hit its output limit mid-answer. The complete leading part of "
+                "its response is shown below; later sections are missing."
+            )
         summary = str(result.get("summary") or "").strip()
         if summary:
             st.info(summary)

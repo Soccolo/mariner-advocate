@@ -31,7 +31,18 @@ CONTRACT_FIELD_KEYS = (
 
 
 class AppError(RuntimeError):
-    """A safe, user-facing application or provider error."""
+    """A safe, user-facing application or provider error.
+
+    `diagnostics` carries only structured, enum-like facts we generated or that
+    the provider returned as short machine codes (HTTP status, error slug,
+    finish reason). Free-form upstream text is never stored here, because a
+    provider can echo submitted case text back inside an error message and the
+    failure record is replayed into later provider prompts.
+    """
+
+    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.diagnostics: dict[str, Any] = dict(diagnostics or {})
 
 
 @dataclass(frozen=True)
@@ -44,6 +55,12 @@ class ProviderConfig:
     zai_model: str = "glm-5.3"
     demo_mode: bool = False
     timeout_seconds: int = 420
+    # claude-opus-5 thinks by default and max_tokens caps thinking plus the
+    # visible answer together, so the budget must cover both.
+    anthropic_max_tokens: int = 32_000
+    anthropic_effort: str = "high"
+    # GLM reasoning is billed from the same output allowance as the final JSON.
+    zai_max_tokens: int = 32_000
 
 
 OFFICIAL_SOURCE_PACK = """
@@ -94,6 +111,106 @@ ANALYSIS_SHAPE = """{
   "nextSteps": [{"order":1, "step":"", "who":""}],
   "disclaimer": ""
 }"""
+
+
+def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
+    """Build a structured-output object schema.
+
+    Structured outputs require `additionalProperties: false` on every object and
+    reject length/range keywords, so the shape stays deliberately plain.
+    """
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _string_array() -> dict[str, Any]:
+    return {"type": "array", "items": {"type": "string"}}
+
+
+def _object_array(properties: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "array", "items": _object_schema(properties)}
+
+
+_TEXT = {"type": "string"}
+_CONFIDENCE = {"type": "string", "enum": ["high", "medium", "low"]}
+
+
+ANALYSIS_JSON_SCHEMA = _object_schema(
+    {
+        "summary": _TEXT,
+        "urgentActions": _object_array(
+            {"action": _TEXT, "why": _TEXT, "timing": _TEXT, "owner": _TEXT}
+        ),
+        "factsReliedOn": _string_array(),
+        "assumptions": _string_array(),
+        "missingFacts": _object_array(
+            {"question": _TEXT, "whyItMatters": _TEXT, "priority": _CONFIDENCE}
+        ),
+        "issues": _object_array(
+            {
+                "issue": _TEXT,
+                "rule": _TEXT,
+                "application": _TEXT,
+                "provisionalConclusion": _TEXT,
+                "confidence": _CONFIDENCE,
+                "sources": _object_array(
+                    {
+                        "title": _TEXT,
+                        "url": _TEXT,
+                        "status": {
+                            "type": "string",
+                            "enum": ["verified-starting-source", "needs-verification"],
+                        },
+                    }
+                ),
+            }
+        ),
+        "possibleEntitlements": _object_array(
+            {
+                "item": _TEXT,
+                "basis": _TEXT,
+                "againstWhom": _TEXT,
+                "verificationNeeded": _TEXT,
+            }
+        ),
+        "evidenceChecklist": _object_array(
+            {"item": _TEXT, "reason": _TEXT, "howToPreserve": _TEXT}
+        ),
+        "deadlineRisks": _object_array(
+            {"risk": _TEXT, "action": _TEXT, "verifiedDeadline": _TEXT}
+        ),
+        "nextSteps": _object_array(
+            {"order": {"type": "integer"}, "step": _TEXT, "who": _TEXT}
+        ),
+        "disclaimer": _TEXT,
+    }
+)
+
+
+CRITIQUE_JSON_SCHEMA = _object_schema(
+    {
+        "agreements": _object_array({"point": _TEXT, "reason": _TEXT}),
+        "disagreements": _object_array(
+            {
+                "topic": _TEXT,
+                "firstPosition": _TEXT,
+                "reviewerPosition": _TEXT,
+                "reason": _TEXT,
+                "materiality": _CONFIDENCE,
+                "evidenceThatWouldResolve": _TEXT,
+            }
+        ),
+        "unsupportedClaims": _object_array(
+            {"claim": _TEXT, "problem": _TEXT, "correction": _TEXT}
+        ),
+        "omissions": _object_array({"item": _TEXT, "importance": _TEXT}),
+        "questionsForArbiter": _string_array(),
+    }
+)
 
 
 FIELD_LABELS = {
@@ -292,6 +409,36 @@ def _limit_arbitration_confidence(
     return arbitration
 
 
+_DIAGNOSTIC_LABELS = {
+    "httpStatus": "HTTP status",
+    "providerErrorCode": "provider error code",
+    "stopReason": "stop reason",
+    "finishReason": "finish reason",
+    "timeoutSeconds": "timeout (seconds)",
+    "networkError": "network error",
+    "streamError": "stream error",
+    "streamFailed": "stream reported an error",
+    "retried": "automatic retry used",
+}
+
+
+def _diagnostics_detail(error: Exception) -> str:
+    """Summarize the structured diagnostics attached to a provider failure.
+
+    Only machine codes and values this module generated are included, so the
+    detail stays safe to display and to replay into later provider prompts.
+    """
+    diagnostics = getattr(error, "diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        return ""
+    parts = [
+        f"{_DIAGNOSTIC_LABELS.get(key, key)}: {value}"
+        for key, value in diagnostics.items()
+        if value not in (None, "", False)
+    ]
+    return " · ".join(parts)[:300]
+
+
 def _provider_failure(
     *, stage: str, provider: str, model: str, error: Exception
 ) -> dict[str, Any]:
@@ -302,6 +449,14 @@ def _provider_failure(
     elif "missing" in raw and "key" in raw:
         error_type = "configuration"
         message = f"{provider} is not configured for this deployment."
+    elif "declined to answer" in raw:
+        error_type = "declined"
+        message = f"{provider} declined to answer this request."
+    elif "output allowance" in raw:
+        error_type = "output_budget_exhausted"
+        message = (
+            f"{provider} spent its entire output allowance before writing an answer."
+        )
     elif any(
         marker in raw
         for marker in (
@@ -326,13 +481,17 @@ def _provider_failure(
     else:
         error_type = "unexpected_error"
         message = f"{provider} could not complete this stage."
-    return {
+    failure = {
         "stage": stage,
         "provider": provider,
         "model": model,
         "errorType": error_type,
         "message": message,
     }
+    detail = _diagnostics_detail(error)
+    if detail:
+        failure["detail"] = detail
+    return failure
 
 
 def _safe_provider_message(data: Any, fallback: str) -> str:
@@ -343,6 +502,39 @@ def _safe_provider_message(data: Any, fallback: str) -> str:
         elif data.get("message"):
             fallback = str(data["message"])
     return re.sub(r"\s+", " ", fallback).strip()[:700]
+
+
+def _provider_error_code(data: Any) -> str:
+    """Return the provider's short machine-readable error slug, if any.
+
+    Only slug-shaped values are accepted so a provider cannot smuggle echoed
+    case text into the diagnostics channel through this field.
+    """
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    candidates = []
+    if isinstance(error, dict):
+        candidates = [error.get("type"), error.get("code")]
+    candidates.append(data.get("code"))
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and len(value) <= 64 and re.fullmatch(r"[A-Za-z0-9_.\-]+", value):
+            return value
+    return ""
+
+
+def _request_diagnostics(
+    *, status: int | None = None, data: Any = None, **extra: Any
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    if status is not None:
+        diagnostics["httpStatus"] = status
+    code = _provider_error_code(data)
+    if code:
+        diagnostics["providerErrorCode"] = code
+    diagnostics.update({key: value for key, value in extra.items() if value not in (None, "")})
+    return diagnostics
 
 
 def _provider_post(
@@ -356,9 +548,15 @@ def _provider_post(
     try:
         response = requests.post(url, headers=headers, json=body, timeout=timeout_seconds)
     except requests.Timeout as exc:
-        raise AppError(f"{label} request timed out. Try again in a moment.") from exc
+        raise AppError(
+            f"{label} request timed out. Try again in a moment.",
+            diagnostics={"timeoutSeconds": timeout_seconds},
+        ) from exc
     except requests.RequestException as exc:
-        raise AppError(f"Could not reach {label}. Check the provider status and try again.") from exc
+        raise AppError(
+            f"Could not reach {label}. Check the provider status and try again.",
+            diagnostics={"networkError": type(exc).__name__},
+        ) from exc
 
     try:
         data = response.json()
@@ -366,9 +564,15 @@ def _provider_post(
         data = {}
     if not response.ok:
         message = _safe_provider_message(data, f"HTTP {response.status_code}")
-        raise AppError(f"{label} request failed: {message}")
+        raise AppError(
+            f"{label} request failed: {message}",
+            diagnostics=_request_diagnostics(status=response.status_code, data=data),
+        )
     if not isinstance(data, dict):
-        raise AppError(f"{label} returned an unexpected response.")
+        raise AppError(
+            f"{label} returned an unexpected response.",
+            diagnostics=_request_diagnostics(status=response.status_code),
+        )
     return data
 
 
@@ -471,6 +675,98 @@ def parse_model_json(text: str, label: str) -> dict[str, Any]:
     )
 
 
+MAX_SALVAGE_ATTEMPTS = 200
+
+
+def _unclosed_containers(prefix: str) -> str | None:
+    """Return the closers needed to balance `prefix`, or None if it is unusable."""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in prefix:
+        if escaped:
+            escaped = False
+            continue
+        if in_string:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]":
+            if not stack:
+                return None
+            stack.pop()
+    if in_string:
+        return None
+    return "".join(reversed(stack))
+
+
+def salvage_truncated_json(text: str) -> dict[str, Any] | None:
+    """Recover the complete leading part of a JSON object cut off mid-generation.
+
+    Only call this when the provider reported that generation stopped because
+    the output allowance ran out, so the response is known to be incomplete
+    rather than malformed. Cuts are only made at separators outside strings, so
+    every value that survives is one the model finished writing; whatever it was
+    part-way through is dropped rather than guessed. The result is flagged so the
+    panel can present it as partial.
+    """
+    cleaned = str(text or "").lstrip("﻿").strip()
+    if "</think>" in cleaned.lower():
+        cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1].strip()
+    fence = re.search(r"```(?:json)?\s*(.*)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+    start = cleaned.find("{")
+    if start < 0:
+        return None
+    candidate = cleaned[start:]
+
+    cuts: list[int] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(candidate):
+        if escaped:
+            escaped = False
+            continue
+        if in_string:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+        elif char == "," and depth >= 1:
+            cuts.append(index)
+
+    for cut in reversed(cuts[-MAX_SALVAGE_ATTEMPTS:]):
+        prefix = candidate[:cut]
+        closers = _unclosed_containers(prefix)
+        if closers is None:
+            continue
+        try:
+            value = json.loads(prefix + closers)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value:
+            value["responseTruncated"] = True
+            return value
+    return None
+
+
 def _call_openai(prompt: str, config: ProviderConfig, *, senior: bool) -> dict[str, Any]:
     reasoning: dict[str, str] = {"effort": "high" if senior else "medium"}
     if senior:
@@ -494,28 +790,222 @@ def _call_openai(prompt: str, config: ProviderConfig, *, senior: bool) -> dict[s
     return parse_model_json(_extract_openai_text(data), "OpenAI")
 
 
-def _call_anthropic(prompt: str, config: ProviderConfig) -> dict[str, Any]:
-    data = _provider_post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": config.anthropic_key,
-            "anthropic-version": "2023-06-01",
-        },
-        body={
-            "model": config.anthropic_model,
-            "max_tokens": 12_000,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        label="Anthropic",
-        timeout_seconds=config.timeout_seconds,
-    )
-    text = "\n".join(
-        str(item.get("text") or "")
-        for item in data.get("content") or []
-        if isinstance(item, dict) and item.get("type") == "text"
-    )
-    return parse_model_json(text, "Anthropic")
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+# Markers that identify a rejected request *parameter*, so the caller can retry
+# without the optional field instead of failing the whole stage.
+_UNSUPPORTED_PARAMETER_MARKERS = (
+    "output_config",
+    "output config",
+    "json_schema",
+    "schema",
+    "effort",
+    "thinking",
+    "unsupported",
+    "unrecognized",
+    "unknown field",
+    "unexpected keyword",
+    "extra inputs",
+    "not supported",
+    "not permitted",
+)
+
+
+def _is_unsupported_parameter_error(error: AppError) -> bool:
+    status = error.diagnostics.get("httpStatus")
+    if status not in (400, 404, 422):
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in _UNSUPPORTED_PARAMETER_MARKERS)
+
+
+def _anthropic_stream(
+    body: dict[str, Any], config: ProviderConfig, *, label: str = "Anthropic"
+) -> dict[str, Any]:
+    """Send a streaming Messages request and accumulate the visible answer.
+
+    Streaming is required rather than cosmetic here: claude-opus-5 thinks before
+    answering, so a single legal-analysis turn can outlast a plain request
+    timeout. With a stream the timeout applies between chunks instead of to the
+    whole turn.
+    """
+    payload = {**body, "stream": True}
+    try:
+        response = requests.post(
+            ANTHROPIC_MESSAGES_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": config.anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "Accept": "text/event-stream",
+            },
+            json=payload,
+            timeout=config.timeout_seconds,
+            stream=True,
+        )
+    except requests.Timeout as exc:
+        raise AppError(
+            f"{label} request timed out. Try again in a moment.",
+            diagnostics={"timeoutSeconds": config.timeout_seconds},
+        ) from exc
+    except requests.RequestException as exc:
+        raise AppError(
+            f"Could not reach {label}. Check the provider status and try again.",
+            diagnostics={"networkError": type(exc).__name__},
+        ) from exc
+
+    text_parts: list[str] = []
+    stop_reason = ""
+    stream_error: dict[str, Any] | None = None
+    with response:
+        if not response.ok:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            message = _safe_provider_message(data, f"HTTP {response.status_code}")
+            raise AppError(
+                f"{label} request failed: {message}",
+                diagnostics=_request_diagnostics(status=response.status_code, data=data),
+            )
+
+        try:
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", "replace")
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[len("data:") :].strip()
+                if not chunk or chunk == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(chunk)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                if event_type == "content_block_start":
+                    block = event.get("content_block")
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(str(block.get("text") or ""))
+                elif event_type == "content_block_delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        text_parts.append(str(delta.get("text") or ""))
+                elif event_type == "message_delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, dict) and delta.get("stop_reason"):
+                        stop_reason = str(delta["stop_reason"])
+                elif event_type == "error":
+                    stream_error = event
+        except requests.RequestException as exc:
+            raise AppError(
+                f"{label} stopped sending its response before it finished.",
+                diagnostics={"streamError": type(exc).__name__},
+            ) from exc
+
+    if stream_error is not None:
+        raise AppError(
+            f"{label} request failed: "
+            f"{_safe_provider_message(stream_error, 'the response stream reported an error')}",
+            diagnostics=_request_diagnostics(data=stream_error, streamFailed=True),
+        )
+    return {"text": "".join(text_parts), "stopReason": stop_reason}
+
+
+def _anthropic_request_variants(
+    prompt: str, config: ProviderConfig, *, schema: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Build the request, most capable first, then progressively plainer.
+
+    Structured outputs and the effort control are the difference between
+    reliable JSON and a coin flip, but they are also the fields most likely to
+    be unavailable on an older model or a restricted account, so each is dropped
+    in turn rather than failing the stage outright.
+    """
+    base: dict[str, Any] = {
+        "model": config.anthropic_model,
+        "max_tokens": max(4_000, int(config.anthropic_max_tokens or 0)),
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    thinking: dict[str, Any] = {"thinking": {"type": "adaptive"}}
+    output_config: dict[str, Any] = {}
+    effort = str(config.anthropic_effort or "").strip().lower()
+    if effort in ANTHROPIC_EFFORT_LEVELS:
+        output_config["effort"] = effort
+
+    variants: list[dict[str, Any]] = []
+    if schema:
+        variants.append(
+            {
+                **base,
+                **thinking,
+                "output_config": {
+                    **output_config,
+                    "format": {"type": "json_schema", "schema": schema},
+                },
+            }
+        )
+    if output_config:
+        variants.append({**base, **thinking, "output_config": output_config})
+    variants.append({**base, **thinking})
+    variants.append(dict(base))
+    return variants
+
+
+def _call_anthropic(
+    prompt: str, config: ProviderConfig, *, schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    variants = _anthropic_request_variants(prompt, config, schema=schema)
+    last_error: AppError | None = None
+    for index, body in enumerate(variants):
+        try:
+            result = _anthropic_stream(body, config)
+        except AppError as error:
+            last_error = error
+            if index + 1 < len(variants) and _is_unsupported_parameter_error(error):
+                continue
+            raise
+
+        stop_reason = str(result.get("stopReason") or "")
+        text = str(result.get("text") or "")
+        if stop_reason == "refusal":
+            raise AppError(
+                "Anthropic declined to answer this request. Rephrase the case facts "
+                "or rely on the other configured providers.",
+                diagnostics={"stopReason": stop_reason},
+            )
+        if not text.strip():
+            if stop_reason == "max_tokens":
+                raise AppError(
+                    "Anthropic used its whole output allowance before writing an answer. "
+                    "Raise ANTHROPIC_MAX_TOKENS or lower ANTHROPIC_EFFORT.",
+                    diagnostics={"stopReason": stop_reason},
+                )
+            raise AppError(
+                "Anthropic returned no final content "
+                f"(finish reason: {stop_reason or 'unknown'}).",
+                diagnostics={"stopReason": stop_reason},
+            )
+
+        try:
+            return parse_model_json(text, "Anthropic")
+        except AppError as error:
+            if stop_reason == "max_tokens":
+                recovered = salvage_truncated_json(text)
+                if recovered is not None:
+                    return recovered
+                raise AppError(
+                    "Anthropic returned truncated JSON. Raise ANTHROPIC_MAX_TOKENS "
+                    "or lower ANTHROPIC_EFFORT.",
+                    diagnostics={"stopReason": stop_reason},
+                ) from error
+            raise
+
+    raise last_error or AppError("Anthropic could not complete this stage.")
 
 
 def _zai_request(
@@ -535,7 +1025,7 @@ def _zai_request(
             "model": config.zai_model,
             "messages": [{"role": "user", "content": prompt}],
             "thinking": {"type": thinking},
-            "max_tokens": 24_000,
+            "max_tokens": max(4_000, int(config.zai_max_tokens or 0)),
             "temperature": temperature,
             "stream": False,
             "response_format": {"type": "json_object"},
@@ -545,16 +1035,16 @@ def _zai_request(
     )
 
 
-def _parse_zai_result(data: dict[str, Any]) -> tuple[dict[str, Any] | None, str, bool]:
+def _parse_zai_result(data: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
     content, _reasoning, finish_reason = _extract_zai_parts(data)
     if content:
         try:
-            return parse_model_json(content, "Z.AI"), finish_reason, True
+            return parse_model_json(content, "Z.AI"), finish_reason, content
         except AppError:
             pass
     # reasoning_content is hidden chain-of-thought, not the final answer. It is
     # intentionally neither displayed nor treated as a completed analysis.
-    return None, finish_reason, bool(content)
+    return None, finish_reason, content
 
 
 def _call_zai(prompt: str, config: ProviderConfig) -> dict[str, Any]:
@@ -564,7 +1054,7 @@ def _call_zai(prompt: str, config: ProviderConfig) -> dict[str, Any]:
         thinking="enabled",
         temperature=0.2,
     )
-    parsed, first_finish_reason, first_had_text = _parse_zai_result(first_data)
+    parsed, first_finish_reason, first_text = _parse_zai_result(first_data)
     if parsed is not None:
         return parsed
 
@@ -581,23 +1071,36 @@ def _call_zai(prompt: str, config: ProviderConfig) -> dict[str, Any]:
         thinking="disabled",
         temperature=0.0,
     )
-    parsed, retry_finish_reason, retry_had_text = _parse_zai_result(retry_data)
+    parsed, retry_finish_reason, retry_text = _parse_zai_result(retry_data)
     if parsed is not None:
         return parsed
 
+    # Both attempts ran out of output allowance. The part that did arrive is a
+    # real analysis, so recover the complete leading section rather than
+    # discarding the whole stage; it is flagged as partial for the reviewer.
     if retry_finish_reason == "length" or first_finish_reason == "length":
+        for text, reason in ((retry_text, retry_finish_reason), (first_text, first_finish_reason)):
+            if reason != "length":
+                continue
+            recovered = salvage_truncated_json(text)
+            if recovered is not None:
+                return recovered
         raise AppError(
-            "Z.AI returned truncated JSON, including after a concise retry. "
-            "The other available providers will continue the panel."
+            "Z.AI returned truncated JSON, including after a concise retry, and too "
+            "little arrived to recover. Raise ZAI_MAX_TOKENS. The other available "
+            "providers will continue the panel.",
+            diagnostics={"finishReason": "length", "retried": True},
         )
-    if first_had_text or retry_had_text:
+    if first_text or retry_text:
         raise AppError(
             "Z.AI did not follow the required JSON format after an automatic retry. "
-            "The other available providers will continue the panel."
+            "The other available providers will continue the panel.",
+            diagnostics={"finishReason": retry_finish_reason, "retried": True},
         )
     raise AppError(
         f"Z.AI returned no usable content (finish reason: {retry_finish_reason}). "
-        "The other available providers will continue the panel."
+        "The other available providers will continue the panel.",
+        diagnostics={"finishReason": retry_finish_reason, "retried": True},
     )
 
 
@@ -608,6 +1111,7 @@ def call_provider(
     *,
     senior: bool = False,
     demo_kind: str = "first",
+    schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if config.demo_mode:
         return demo_response(demo_kind)
@@ -621,7 +1125,7 @@ def call_provider(
     if provider == "openai":
         return _call_openai(prompt, config, senior=senior)
     if provider == "anthropic":
-        return _call_anthropic(prompt, config)
+        return _call_anthropic(prompt, config, schema=schema)
     if provider == "zai":
         return _call_zai(prompt, config)
     raise AppError(f"Unsupported provider: {provider}")
@@ -724,6 +1228,23 @@ def extract_contract_fields(
     return _normalize_contract_extraction(result)
 
 
+def _truncation_warning(
+    *, stage: str, provider: str, model: str, result: Any
+) -> dict[str, Any] | None:
+    if not isinstance(result, dict) or not result.get("responseTruncated"):
+        return None
+    return {
+        "stage": stage,
+        "provider": provider,
+        "model": model,
+        "errorType": "truncated_response",
+        "message": (
+            f"{provider} ran out of output allowance mid-answer. The complete leading "
+            "part of its response was recovered, but later sections are missing."
+        ),
+    }
+
+
 def analyze_case(
     case_data: dict[str, Any],
     config: ProviderConfig,
@@ -732,6 +1253,7 @@ def analyze_case(
     validate_case(case_data)
     notify = progress or (lambda _message: None)
     provider_failures: list[dict[str, Any]] = []
+    provider_warnings: list[dict[str, Any]] = []
     stage_status = {
         "firstAnalysis": "pending",
         "independentAnalysis": "pending",
@@ -753,6 +1275,7 @@ def analyze_case(
             independent_reviewer_prompt(case_data),
             config,
             demo_kind="independent",
+            schema=ANALYSIS_JSON_SCHEMA,
         )
         first: dict[str, Any] | None = None
         independent: dict[str, Any] | None = None
@@ -762,6 +1285,14 @@ def analyze_case(
                 raise AppError("Z.AI returned an unexpected analysis result.")
             first = first_result
             stage_status["firstAnalysis"] = "completed"
+            warning = _truncation_warning(
+                stage="firstAnalysis",
+                provider="Z.AI",
+                model=config.zai_model,
+                result=first,
+            )
+            if warning:
+                provider_warnings.append(warning)
         except Exception as error:
             stage_status["firstAnalysis"] = "failed"
             provider_failures.append(
@@ -778,6 +1309,14 @@ def analyze_case(
                 raise AppError("Anthropic returned an unexpected independent analysis result.")
             independent = independent_result
             stage_status["independentAnalysis"] = "completed"
+            warning = _truncation_warning(
+                stage="independentAnalysis",
+                provider="Anthropic",
+                model=config.anthropic_model,
+                result=independent,
+            )
+            if warning:
+                provider_warnings.append(warning)
         except Exception as error:
             stage_status["independentAnalysis"] = "failed"
             provider_failures.append(
@@ -799,13 +1338,24 @@ def analyze_case(
         try:
             critique_result = call_provider(
                 "anthropic",
-                critique_prompt(case_data, first, independent, provider_failures),
+                critique_prompt(
+                    case_data, first, independent, provider_failures + provider_warnings
+                ),
                 config,
                 demo_kind="critique",
+                schema=CRITIQUE_JSON_SCHEMA,
             )
             if not isinstance(critique_result, dict):
                 raise AppError("Anthropic returned an unexpected critique result.")
             critique = dict(critique_result)
+            warning = _truncation_warning(
+                stage="critique",
+                provider="Anthropic",
+                model=config.anthropic_model,
+                result=critique,
+            )
+            if warning:
+                provider_warnings.append(warning)
             if available_count < 2:
                 # A model cannot agree or disagree with an analysis that does not
                 # exist, regardless of what its generated JSON claims.
@@ -833,7 +1383,11 @@ def analyze_case(
             arbitration_result = call_provider(
                 "openai",
                 arbiter_prompt(
-                    case_data, first, independent, critique, provider_failures
+                    case_data,
+                    first,
+                    independent,
+                    critique,
+                    provider_failures + provider_warnings,
                 ),
                 config,
                 senior=True,
@@ -863,7 +1417,9 @@ def analyze_case(
         )
 
     if arbitration is not None:
-        workflow_status = "degraded" if provider_failures else "complete"
+        workflow_status = (
+            "degraded" if (provider_failures or provider_warnings) else "complete"
+        )
     elif any(isinstance(value, dict) for value in (first, independent, critique)):
         workflow_status = "partial"
     else:
@@ -890,6 +1446,7 @@ def analyze_case(
         },
         "stageStatus": stage_status,
         "providerFailures": provider_failures,
+        "providerWarnings": provider_warnings,
         "first": first,
         "independent": independent,
         "critique": critique,
