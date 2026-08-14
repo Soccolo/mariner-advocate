@@ -38,6 +38,15 @@ contract text is sent to OpenAI to populate contract-related intake fields.
    complaint, or chronology from the arbitrated record.
 7. A follow-up workspace discusses the next required steps using that same record.
 
+Provider stages are isolated. If Z.AI or either Claude stage fails or returns invalid
+JSON, successful stages are preserved. When at least one independent analysis exists,
+OpenAI still performs a confidence-limited synthesis. If neither independent analysis
+completes, arbitration and downstream document actions are safely skipped. If OpenAI
+arbitration fails, completed Z.AI and Claude analyses remain available in the
+**Analyses** tab, while drafting and follow-up stay disabled. A malformed Z.AI response
+is retried once with the same model, JSON mode, a larger output allowance, and hidden
+thinking disabled.
+
 Contract import accepts files up to 10 MB and rejects encrypted, scanned/no-text,
 macro-enabled, malformed, or excessively large documents. Existing case values are
 preserved by default, and all imported values remain editable before panel analysis.
@@ -76,6 +85,9 @@ Alternatively, copy `.streamlit/secrets.toml.example` to
 `.streamlit/secrets.toml`, add the values, and keep that file uncommitted. The
 `.gitignore` already excludes it.
 
+A live panel needs at least two provider keys. Missing stages are shown explicitly;
+full three-model coverage is recommended for the intended review architecture.
+
 Supported settings:
 
 | Setting | Default | Purpose |
@@ -91,7 +103,9 @@ Supported settings:
 | `PUBLIC_DEMO_ONLY` | `false` | Force demo mode and require fictional-data acknowledgment |
 | `REQUEST_TIMEOUT_SECONDS` | `420` | Provider request timeout, bounded to 60-900 seconds |
 
-The defaults use Anthropic's `claude-opus-5` and Z.AI's `glm-5.3` model IDs.
+The defaults use Anthropic's `claude-opus-5` and Z.AI's `glm-5.3` model IDs. Provider
+model availability is account-specific, so `ZAI_MODEL` must match an exact model ID
+enabled in the connected Z.AI account.
 
 OpenAI's official model documentation identifies `gpt-5.6-sol` as the frontier model
 for complex work and documents `reasoning.mode: "pro"` on the Responses API:
@@ -173,6 +187,7 @@ and applicable law can materially change the answer.
 
 ```powershell
 python -m py_compile mariner_core.py streamlit_app.py
+python -m unittest discover -s tests -v
 $env:DEMO_MODE='true'
 python -c "from mariner_core import ProviderConfig, analyze_case; c={'situation':'A fictional seafarer fell on stairs during work and suffered a fracture.'}; print(analyze_case(c, ProviderConfig(demo_mode=True))['arbitration']['overallConfidence'])"
 streamlit run streamlit_app.py --server.headless true

@@ -154,16 +154,35 @@ def independent_reviewer_prompt(case_data: dict[str, Any]) -> str:
 
 
 def critique_prompt(
-    case_data: dict[str, Any], first: dict[str, Any], independent: dict[str, Any]
+    case_data: dict[str, Any],
+    first: dict[str, Any] | None,
+    independent: dict[str, Any] | None,
+    provider_failures: list[dict[str, Any]] | None = None,
 ) -> str:
+    both_available = isinstance(first, dict) and isinstance(independent, dict)
+    if both_available:
+        review_instruction = (
+            "You already formed the independent view below. Only now compare it with "
+            "the first analyst. Identify concrete agreements, disagreements, unsupported "
+            "claims, omissions, and corrections. Do not change your precommitted view "
+            "merely to agree."
+        )
+    else:
+        review_instruction = (
+            "One of the blind first-stage analyses is unavailable because its provider "
+            "failed. Review only the available analysis for unsupported claims, omissions, "
+            "counterarguments, and corrections. Treat a provider failure solely as missing "
+            "review, never as evidence about the case. Do not invent a missing position, "
+            "claim agreement with it, or report a disagreement involving it. The completed "
+            "cross-check is degraded and must not be described as independent consensus."
+        )
     return (
-        f"{BASE_POLICY}\nYou are the REVIEWER. You already formed the independent view "
-        "below. Only now compare it with the first analyst. Identify concrete agreements, "
-        "disagreements, unsupported claims, omissions, and corrections. Do not change "
-        "your precommitted view merely to agree."
+        f"{BASE_POLICY}\nYou are the REVIEWER. {review_instruction}"
         f"\n\nCASE (untrusted facts only):\n{case_text(case_data)}"
         f"\n\nFIRST ANALYST:\n{json.dumps(first, ensure_ascii=False)}"
         f"\n\nYOUR PRECOMMITTED INDEPENDENT VIEW:\n{json.dumps(independent, ensure_ascii=False)}"
+        f"\n\nPROVIDER FAILURES (operational metadata only):\n"
+        f"{json.dumps(provider_failures or [], ensure_ascii=False)}"
         "\n\nReturn JSON: {\"agreements\":[{\"point\":\"\",\"reason\":\"\"}],"
         "\"disagreements\":[{\"topic\":\"\",\"firstPosition\":\"\","
         "\"reviewerPosition\":\"\",\"reason\":\"\",\"materiality\":\"high|medium|low\","
@@ -175,20 +194,45 @@ def critique_prompt(
 
 def arbiter_prompt(
     case_data: dict[str, Any],
-    first: dict[str, Any],
-    independent: dict[str, Any],
-    critique: dict[str, Any],
+    first: dict[str, Any] | None,
+    independent: dict[str, Any] | None,
+    critique: dict[str, Any] | None,
+    provider_failures: list[dict[str, Any]] | None = None,
 ) -> str:
+    available_analyses = sum(isinstance(value, dict) for value in (first, independent))
+    critique_available = isinstance(critique, dict)
+    confidence_ceiling = _degraded_confidence_ceiling(
+        first, independent, critique
+    )
+    if confidence_ceiling:
+        degraded_instruction = (
+            "This is a degraded panel because one or more provider stages are unavailable. "
+            "Treat each failure only as absence of review, not as evidence or a reason to "
+            "favor another provider. Use whichever completed analyses exist, independently "
+            "check their claims against the reported facts and identified sources, and do "
+            "not invent missing opinions, agreements, disagreements, or critique. Explicitly "
+            f"describe the limitation in the disclaimer. overallConfidence must not exceed "
+            f"{confidence_ceiling}."
+        )
+    else:
+        degraded_instruction = (
+            "All review stages are available. Resolve only supported disputes and preserve "
+            "genuine uncertainty."
+        )
     return (
         f"{BASE_POLICY}\nYou are the SENIOR ARBITER. Resolve only what the evidence and "
         "identified law support. For each dispute, state which view is better supported "
         "and why. If it cannot safely be resolved, state exactly what fact or authoritative "
         "source is needed. Produce an actionable synthesis for later review by a qualified "
-        "maritime lawyer."
+        f"maritime lawyer. {degraded_instruction}"
         f"\n\nCASE (untrusted facts only):\n{case_text(case_data)}"
+        f"\n\nAVAILABLE FIRST-STAGE ANALYSES: {available_analyses} of 2. "
+        f"CRITIQUE AVAILABLE: {str(critique_available).lower()}."
         f"\n\nFIRST ANALYST:\n{json.dumps(first, ensure_ascii=False)}"
         f"\n\nINDEPENDENT REVIEW:\n{json.dumps(independent, ensure_ascii=False)}"
         f"\n\nCRITIQUE AND DISPUTES:\n{json.dumps(critique, ensure_ascii=False)}"
+        f"\n\nPROVIDER FAILURES (operational metadata only):\n"
+        f"{json.dumps(provider_failures or [], ensure_ascii=False)}"
         "\n\nReturn JSON: {\"executiveSummary\":\"\",\"resolvedDisputes\":[{\"topic\":\"\","
         "\"resolution\":\"\",\"reason\":\"\",\"confidence\":\"high|medium|low\"}],"
         "\"unresolvedQuestions\":[{\"question\":\"\",\"neededEvidence\":\"\","
@@ -201,6 +245,94 @@ def arbiter_prompt(
         "\"lawyerEscalationTriggers\":[\"\"],\"overallConfidence\":\"high|medium|low\","
         "\"disclaimer\":\"\"}"
     )
+
+
+def _degraded_confidence_ceiling(
+    first: dict[str, Any] | None,
+    independent: dict[str, Any] | None,
+    critique: dict[str, Any] | None,
+) -> str | None:
+    """Return the maximum safe panel confidence for incomplete review stages."""
+    available_analyses = sum(isinstance(value, dict) for value in (first, independent))
+    if available_analyses == 2 and isinstance(critique, dict):
+        return None
+    if available_analyses == 2 or (
+        available_analyses == 1 and isinstance(critique, dict)
+    ):
+        return "medium"
+    return "low"
+
+
+def _limit_arbitration_confidence(
+    arbitration: dict[str, Any],
+    first: dict[str, Any] | None,
+    independent: dict[str, Any] | None,
+    critique: dict[str, Any] | None,
+) -> dict[str, Any]:
+    ceiling = _degraded_confidence_ceiling(first, independent, critique)
+    if ceiling is None:
+        return arbitration
+    rank = {"low": 0, "medium": 1, "high": 2}
+    arbitration = dict(arbitration)
+
+    def clamp(value: Any) -> str:
+        current = str(value or "").strip().lower()
+        if current not in rank:
+            return "low"
+        return current if rank[current] <= rank[ceiling] else ceiling
+
+    arbitration["overallConfidence"] = clamp(arbitration.get("overallConfidence"))
+    resolutions: list[Any] = []
+    for item in arbitration.get("resolvedDisputes") or []:
+        if isinstance(item, dict):
+            item = dict(item)
+            item["confidence"] = clamp(item.get("confidence"))
+        resolutions.append(item)
+    arbitration["resolvedDisputes"] = resolutions
+    return arbitration
+
+
+def _provider_failure(
+    *, stage: str, provider: str, model: str, error: Exception
+) -> dict[str, Any]:
+    raw = str(error).lower() if isinstance(error, AppError) else ""
+    if "timed out" in raw:
+        error_type = "timeout"
+        message = f"{provider} timed out before completing this stage."
+    elif "missing" in raw and "key" in raw:
+        error_type = "configuration"
+        message = f"{provider} is not configured for this deployment."
+    elif any(
+        marker in raw
+        for marker in (
+            "unreadable",
+            "json format",
+            "truncated json",
+            "no usable content",
+            "no final content",
+            "unexpected response",
+        )
+    ):
+        error_type = "invalid_response"
+        message = f"{provider} did not return a complete structured response."
+    elif "request failed" in raw:
+        error_type = "request_rejected"
+        message = (
+            f"{provider} rejected the request. Check model access, quota, and provider settings."
+        )
+    elif "could not reach" in raw:
+        error_type = "network"
+        message = f"{provider} could not be reached from the app server."
+    else:
+        error_type = "unexpected_error"
+        message = f"{provider} could not complete this stage."
+    return {
+        "stage": stage,
+        "provider": provider,
+        "model": model,
+        "errorType": error_type,
+        "message": message,
+    }
 
 
 def _safe_provider_message(data: Any, fallback: str) -> str:
@@ -273,41 +405,67 @@ def _provider_content_text(value: Any) -> str:
     return ""
 
 
-def _extract_zai_text(data: dict[str, Any]) -> tuple[str, str]:
+def _extract_zai_parts(data: dict[str, Any]) -> tuple[str, str, str]:
     choices = data.get("choices") or []
     if not choices or not isinstance(choices[0], dict):
-        return "", "unknown"
+        return "", "", "unknown"
     choice = choices[0]
     finish_reason = str(choice.get("finish_reason") or "unknown")
     message = choice.get("message")
     if not isinstance(message, dict):
-        return "", finish_reason
+        return "", "", finish_reason
 
     content = _provider_content_text(message.get("content")).strip()
-    if content:
-        return content, finish_reason
-
-    # Some OpenAI-compatible Z.AI responses put all generated text in the
-    # reasoning field. Use it only when final content is absent.
     reasoning = _provider_content_text(message.get("reasoning_content")).strip()
-    return reasoning, finish_reason
+    return content, reasoning, finish_reason
+
+
+def _extract_zai_text(data: dict[str, Any]) -> tuple[str, str]:
+    content, _reasoning, finish_reason = _extract_zai_parts(data)
+    return content, finish_reason
+
+
+def _decoded_json_object(candidate: str) -> dict[str, Any] | None:
+    try:
+        value: Any = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    # Occasionally an OpenAI-compatible endpoint double-encodes JSON as a
+    # JSON string. Unwrap it once without accepting arbitrary Python reprs.
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return value if isinstance(value, dict) else None
+
 
 
 def parse_model_json(text: str, label: str) -> dict[str, Any]:
-    cleaned = str(text or "").strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    candidates = [cleaned]
-    first, last = cleaned.find("{"), cleaned.rfind("}")
-    if first >= 0 and last > first:
-        candidates.append(cleaned[first : last + 1])
+    cleaned = str(text or "").lstrip("\ufeff").strip()
+    if "</think>" in cleaned.lower():
+        cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1].strip()
+
+    fenced = re.findall(
+        r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL
+    )
+    candidates = [cleaned, *fenced]
     for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
+        value = _decoded_json_object(candidate)
+        if value is not None:
             return value
+
+        # Allow a short prose prefix/suffix, but decode only the first object.
+        # This deliberately avoids accepting a nested object from truncated JSON.
+        first = candidate.find("{")
+        if first >= 0:
+            try:
+                raw_value, _end = json.JSONDecoder().raw_decode(candidate[first:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(raw_value, dict):
+                return raw_value
     raise AppError(
         f"{label} returned an unreadable response. Try again or configure a different model."
     )
@@ -360,8 +518,14 @@ def _call_anthropic(prompt: str, config: ProviderConfig) -> dict[str, Any]:
     return parse_model_json(text, "Anthropic")
 
 
-def _call_zai(prompt: str, config: ProviderConfig) -> dict[str, Any]:
-    data = _provider_post(
+def _zai_request(
+    prompt: str,
+    config: ProviderConfig,
+    *,
+    thinking: str,
+    temperature: float,
+) -> dict[str, Any]:
+    return _provider_post(
         "https://api.z.ai/api/paas/v4/chat/completions",
         headers={
             "Content-Type": "application/json",
@@ -370,27 +534,71 @@ def _call_zai(prompt: str, config: ProviderConfig) -> dict[str, Any]:
         body={
             "model": config.zai_model,
             "messages": [{"role": "user", "content": prompt}],
-            "thinking": {"type": "enabled"},
-            "max_tokens": 12_000,
-            "temperature": 0.2,
+            "thinking": {"type": thinking},
+            "max_tokens": 24_000,
+            "temperature": temperature,
             "stream": False,
             "response_format": {"type": "json_object"},
         },
         label="Z.AI",
         timeout_seconds=config.timeout_seconds,
     )
-    text, finish_reason = _extract_zai_text(data)
-    if not text:
-        if finish_reason == "length":
-            raise AppError(
-                "Z.AI used its output budget before returning the final JSON. "
-                "Try a shorter case description or increase the configured request limit."
-            )
+
+
+def _parse_zai_result(data: dict[str, Any]) -> tuple[dict[str, Any] | None, str, bool]:
+    content, _reasoning, finish_reason = _extract_zai_parts(data)
+    if content:
+        try:
+            return parse_model_json(content, "Z.AI"), finish_reason, True
+        except AppError:
+            pass
+    # reasoning_content is hidden chain-of-thought, not the final answer. It is
+    # intentionally neither displayed nor treated as a completed analysis.
+    return None, finish_reason, bool(content)
+
+
+def _call_zai(prompt: str, config: ProviderConfig) -> dict[str, Any]:
+    first_data = _zai_request(
+        prompt,
+        config,
+        thinking="enabled",
+        temperature=0.2,
+    )
+    parsed, first_finish_reason, first_had_text = _parse_zai_result(first_data)
+    if parsed is not None:
+        return parsed
+
+    # GLM reasoning can consume the output allowance before final JSON is
+    # emitted. Retry once without hidden thinking and with an explicit concise
+    # JSON reminder. The retry uses the same configured model.
+    retry_prompt = (
+        f"{prompt}\n\nRESPONSE CORRECTION: Return one complete, concise JSON object only. "
+        "Do not include Markdown, prose before the object, or hidden thinking."
+    )
+    retry_data = _zai_request(
+        retry_prompt,
+        config,
+        thinking="disabled",
+        temperature=0.0,
+    )
+    parsed, retry_finish_reason, retry_had_text = _parse_zai_result(retry_data)
+    if parsed is not None:
+        return parsed
+
+    if retry_finish_reason == "length" or first_finish_reason == "length":
         raise AppError(
-            f"Z.AI returned no final content (finish reason: {finish_reason}). "
-            "Try again or check the configured Z.AI model."
+            "Z.AI returned truncated JSON, including after a concise retry. "
+            "The other available providers will continue the panel."
         )
-    return parse_model_json(text, "Z.AI")
+    if first_had_text or retry_had_text:
+        raise AppError(
+            "Z.AI did not follow the required JSON format after an automatic retry. "
+            "The other available providers will continue the panel."
+        )
+    raise AppError(
+        f"Z.AI returned no usable content (finish reason: {retry_finish_reason}). "
+        "The other available providers will continue the panel."
+    )
 
 
 def call_provider(
@@ -523,6 +731,13 @@ def analyze_case(
 ) -> dict[str, Any]:
     validate_case(case_data)
     notify = progress or (lambda _message: None)
+    provider_failures: list[dict[str, Any]] = []
+    stage_status = {
+        "firstAnalysis": "pending",
+        "independentAnalysis": "pending",
+        "critique": "pending",
+        "arbitration": "pending",
+    }
     notify("Running two blind, independent analyses in parallel...")
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mariner-panel") as executor:
         first_future = executor.submit(
@@ -539,35 +754,142 @@ def analyze_case(
             config,
             demo_kind="independent",
         )
-        first = first_future.result()
-        independent = independent_future.result()
+        first: dict[str, Any] | None = None
+        independent: dict[str, Any] | None = None
+        try:
+            first_result = first_future.result()
+            if not isinstance(first_result, dict):
+                raise AppError("Z.AI returned an unexpected analysis result.")
+            first = first_result
+            stage_status["firstAnalysis"] = "completed"
+        except Exception as error:
+            stage_status["firstAnalysis"] = "failed"
+            provider_failures.append(
+                _provider_failure(
+                    stage="firstAnalysis",
+                    provider="Z.AI",
+                    model=config.zai_model,
+                    error=error,
+                )
+            )
+        try:
+            independent_result = independent_future.result()
+            if not isinstance(independent_result, dict):
+                raise AppError("Anthropic returned an unexpected independent analysis result.")
+            independent = independent_result
+            stage_status["independentAnalysis"] = "completed"
+        except Exception as error:
+            stage_status["independentAnalysis"] = "failed"
+            provider_failures.append(
+                _provider_failure(
+                    stage="independentAnalysis",
+                    provider="Anthropic",
+                    model=config.anthropic_model,
+                    error=error,
+                )
+            )
 
-    notify("Independent views committed. Claude is mapping disputes and omissions...")
-    critique = call_provider(
-        "anthropic",
-        critique_prompt(case_data, first, independent),
-        config,
-        demo_kind="critique",
-    )
-    notify("Disputes mapped. OpenAI is performing senior arbitration...")
-    arbitration = call_provider(
-        "openai",
-        arbiter_prompt(case_data, first, independent, critique),
-        config,
-        senior=True,
-        demo_kind="arbitration",
-    )
+    available_count = sum(isinstance(value, dict) for value in (first, independent))
+    critique: dict[str, Any] | None = None
+    if available_count:
+        notify(
+            f"{available_count} of 2 independent analyses completed. "
+            "Claude is mapping disputes, omissions, and limitations..."
+        )
+        try:
+            critique_result = call_provider(
+                "anthropic",
+                critique_prompt(case_data, first, independent, provider_failures),
+                config,
+                demo_kind="critique",
+            )
+            if not isinstance(critique_result, dict):
+                raise AppError("Anthropic returned an unexpected critique result.")
+            critique = dict(critique_result)
+            if available_count < 2:
+                # A model cannot agree or disagree with an analysis that does not
+                # exist, regardless of what its generated JSON claims.
+                critique["agreements"] = []
+                critique["disagreements"] = []
+            stage_status["critique"] = "completed"
+        except Exception as error:
+            stage_status["critique"] = "failed"
+            provider_failures.append(
+                _provider_failure(
+                    stage="critique",
+                    provider="Anthropic",
+                    model=config.anthropic_model,
+                    error=error,
+                )
+            )
+    else:
+        stage_status["critique"] = "skipped"
+        notify("Both first-stage analyses failed. Skipping comparison and escalating the case facts directly.")
+
+    arbitration: dict[str, Any] | None = None
+    if available_count:
+        notify("OpenAI is performing senior arbitration with the available panel record...")
+        try:
+            arbitration_result = call_provider(
+                "openai",
+                arbiter_prompt(
+                    case_data, first, independent, critique, provider_failures
+                ),
+                config,
+                senior=True,
+                demo_kind="arbitration",
+            )
+            if not isinstance(arbitration_result, dict):
+                raise AppError("OpenAI returned an unexpected arbitration result.")
+            arbitration = _limit_arbitration_confidence(
+                arbitration_result, first, independent, critique
+            )
+            stage_status["arbitration"] = "completed"
+        except Exception as error:
+            stage_status["arbitration"] = "failed"
+            provider_failures.append(
+                _provider_failure(
+                    stage="arbitration",
+                    provider="OpenAI",
+                    model=config.openai_model,
+                    error=error,
+                )
+            )
+    else:
+        stage_status["arbitration"] = "skipped"
+        notify(
+            "No independent analysis completed, so senior arbitration and downstream "
+            "document actions were safely skipped."
+        )
+
+    if arbitration is not None:
+        workflow_status = "degraded" if provider_failures else "complete"
+    elif any(isinstance(value, dict) for value in (first, independent, critique)):
+        workflow_status = "partial"
+    else:
+        workflow_status = "failed"
+
+    if independent is not None:
+        anchoring_control = (
+            "The reviewer formed and committed an independent view before seeing the "
+            "first analysis."
+        )
+    else:
+        anchoring_control = (
+            "The independent Anthropic review was unavailable; no independent reviewer "
+            "view should be inferred."
+        )
     return {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "workflow": {
+            "status": workflow_status,
             "analyst": f"Z.AI {config.zai_model}",
             "reviewer": f"Anthropic {config.anthropic_model}",
             "arbiter": f"OpenAI {config.openai_model} (high reasoning, pro mode)",
-            "anchoringControl": (
-                "The reviewer formed and committed an independent view before seeing "
-                "the first analysis."
-            ),
+            "anchoringControl": anchoring_control,
         },
+        "stageStatus": stage_status,
+        "providerFailures": provider_failures,
         "first": first,
         "independent": independent,
         "critique": critique,

@@ -731,7 +731,8 @@ def render_header() -> None:
 
 def render_intake(config: ProviderConfig) -> None:
     apply_pending_contract_import()
-    missing = []
+    missing: list[str] = []
+    configured_provider_count = 3
     if not config.demo_mode:
         if not config.zai_key:
             missing.append("ZAI_API_KEY")
@@ -739,11 +740,19 @@ def render_intake(config: ProviderConfig) -> None:
             missing.append("ANTHROPIC_API_KEY")
         if not config.openai_key:
             missing.append("OPENAI_API_KEY")
+        configured_provider_count = 3 - len(missing)
+    review_disabled = not config.demo_mode and configured_provider_count < 2
     if missing:
-        st.error(
-            "Live review is disabled until these server-side settings are added: "
-            + ", ".join(missing)
-        )
+        if review_disabled:
+            st.error(
+                "Live review needs at least two configured AI providers. Missing: "
+                + ", ".join(missing)
+            )
+        else:
+            st.warning(
+                "The panel can run with reduced coverage. This provider is not configured: "
+                + ", ".join(missing)
+            )
 
     st.subheader("Case intake")
     st.caption("Use facts you know and mark uncertain details as uncertain.")
@@ -819,7 +828,7 @@ def render_intake(config: ProviderConfig) -> None:
             st.write(
                 "Remove passport numbers, banking details, full home addresses, passwords, and "
                 "unrelated medical history. Share only what is necessary. This app does not "
-                "persist cases to a database, but live case facts are sent to all three providers."
+                "persist cases to a database, but live case facts are sent to the configured providers."
             )
 
         fictional_confirmed = True
@@ -833,7 +842,7 @@ def render_intake(config: ProviderConfig) -> None:
             "Run the legal review panel",
             type="primary",
             use_container_width=True,
-            disabled=bool(missing),
+            disabled=review_disabled,
         )
 
     if import_submitted:
@@ -872,12 +881,43 @@ def render_intake(config: ProviderConfig) -> None:
     try:
         with st.status("Panel in session", expanded=True) as status:
             panel = analyze_case(case_data, config, progress=status.write)
-            status.update(label="Panel review complete", state="complete", expanded=False)
+            workflow_status = str((panel.get("workflow") or {}).get("status") or "failed")
+            if workflow_status == "complete":
+                status.update(label="Panel review complete", state="complete", expanded=False)
+            elif workflow_status == "degraded":
+                status.update(
+                    label="Review finished with reduced provider coverage",
+                    state="complete",
+                    expanded=False,
+                )
+            elif workflow_status == "partial":
+                status.update(
+                    label="Senior arbitration failed; partial analyses were preserved",
+                    state="error",
+                    expanded=False,
+                )
+            else:
+                status.update(
+                    label="No usable provider panel could be completed",
+                    state="error",
+                    expanded=False,
+                )
         st.session_state.panel = panel
         st.session_state.submitted_case = case_data
         st.session_state.pop("draft", None)
         st.session_state.pop("discussion", None)
-        st.success("The panel completed its review.")
+        failures = safe_list(panel.get("providerFailures"))
+        if workflow_status == "degraded":
+            st.warning(
+                f"Review finished with reduced coverage: {len(failures)} provider stage(s) "
+                "were unavailable. The available models continued."
+            )
+        elif workflow_status == "partial":
+            st.error("Senior arbitration failed. Any completed earlier analyses were preserved.")
+        elif workflow_status == "failed":
+            st.error("No independent provider analysis completed. No arbitration was produced.")
+        else:
+            st.success("The panel completed its review.")
     except AppError as exc:
         st.error(str(exc))
     except Exception:
@@ -885,8 +925,14 @@ def render_intake(config: ProviderConfig) -> None:
 
 
 def render_overview(panel: dict[str, Any]) -> None:
-    arbitration = panel.get("arbitration") or {}
+    arbitration = panel.get("arbitration")
     workflow = panel.get("workflow") or {}
+    if not isinstance(arbitration, dict):
+        st.error(
+            "Senior OpenAI arbitration was unavailable. Any completed earlier analyses "
+            "are preserved in the Analyses tab, but there is no final synthesis."
+        )
+        return
     st.info(str(arbitration.get("executiveSummary") or "No synthesis was returned."))
     metric_a, metric_b, metric_c = st.columns(3)
     metric_a.metric("Overall confidence", str(arbitration.get("overallConfidence") or "unclear").title())
@@ -932,13 +978,79 @@ def render_overview(panel: dict[str, Any]) -> None:
     )
 
 
+def render_panel_health(panel: dict[str, Any]) -> None:
+    failures = safe_list(panel.get("providerFailures"))
+    if not failures:
+        return
+
+    workflow = panel.get("workflow") or {}
+    status = str(workflow.get("status") or "degraded")
+    if status == "degraded":
+        st.warning(
+            "Reduced panel coverage: at least one provider stage failed, but the available "
+            "models continued and OpenAI completed a confidence-limited synthesis."
+        )
+    elif status == "partial":
+        st.error(
+            "Partial panel only: senior arbitration failed, but completed earlier analyses "
+            "have been preserved below."
+        )
+    else:
+        st.error("The provider panel could not produce a usable final review.")
+
+    stage_labels = {
+        "firstAnalysis": "Z.AI first analysis",
+        "independentAnalysis": "Claude independent analysis",
+        "critique": "Claude comparison",
+        "arbitration": "OpenAI senior arbitration",
+    }
+    with st.expander("Provider status details"):
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            stage = str(failure.get("stage") or "provider stage")
+            model = str(failure.get("model") or "unknown model")
+            message = str(failure.get("message") or "No usable response was returned.")
+            st.markdown(f"**{stage_labels.get(stage, stage)} · {model}**")
+            st.caption(message)
+
+
+def render_available_analyses(panel: dict[str, Any]) -> None:
+    entries = [
+        ("Z.AI first analysis", "first"),
+        ("Claude independent analysis", "independent"),
+        ("Claude comparison and critique", "critique"),
+    ]
+    for title, key in entries:
+        st.subheader(title)
+        result = panel.get(key)
+        if not isinstance(result, dict):
+            st.warning("This stage was unavailable. Other completed provider results were preserved.")
+            continue
+        summary = str(result.get("summary") or "").strip()
+        if summary:
+            st.info(summary)
+        urgent_actions = safe_list(result.get("urgentActions"))
+        if urgent_actions:
+            st.markdown("**Urgent actions surfaced by this model**")
+            for action in urgent_actions:
+                if isinstance(action, dict):
+                    st.write(f"- {item_text(action, 'action', 'Action to confirm')}")
+        with st.expander("View full structured response"):
+            st.json(result)
+
+
 def render_disputes(panel: dict[str, Any]) -> None:
     critique = panel.get("critique") or {}
     arbitration = panel.get("arbitration") or {}
+    critique_available = isinstance(panel.get("critique"), dict)
+    if not critique_available:
+        st.warning("Claude's comparison stage was unavailable; no cross-model disputes can be shown.")
     disagreements = safe_list(critique.get("disagreements"))
-    st.subheader("Where the models disagreed")
-    if not disagreements:
-        st.info("No material disagreement was returned.")
+    if critique_available:
+        st.subheader("Where the models disagreed")
+        if not disagreements:
+            st.info("No material disagreement was returned.")
     for disagreement in disagreements:
         if not isinstance(disagreement, dict):
             continue
@@ -1049,7 +1161,10 @@ def render_evidence(panel: dict[str, Any]) -> None:
 
 
 def render_documents(panel: dict[str, Any], case_data: dict[str, Any], config: ProviderConfig) -> None:
-    arbitration = panel.get("arbitration") or {}
+    arbitration = panel.get("arbitration")
+    if not isinstance(arbitration, dict):
+        st.warning("Document drafting is unavailable until senior arbitration succeeds.")
+        return
     plan = safe_list(arbitration.get("documentPlan"))
     st.subheader("Recommended document set")
     for item in plan:
@@ -1138,6 +1253,9 @@ def render_documents(panel: dict[str, Any], case_data: dict[str, Any], config: P
 
 
 def render_followup(panel: dict[str, Any], case_data: dict[str, Any], config: ProviderConfig) -> None:
+    if not isinstance(panel.get("arbitration"), dict):
+        st.warning("Next-step discussion is unavailable until senior arbitration succeeds.")
+        return
     st.subheader("Discuss the next required steps")
     st.caption(
         "Answers use the arbitrated record. They cannot verify new law, deadlines, medical facts, or documents."
@@ -1211,17 +1329,28 @@ def render_results(config: ProviderConfig) -> None:
         )
         return
 
-    st.subheader("Arbitrated case review")
-    tabs = st.tabs(["Overview", "Disputes", "Evidence", "Documents", "Ask next steps"])
+    workflow_status = str((panel.get("workflow") or {}).get("status") or "failed")
+    if isinstance(panel.get("arbitration"), dict):
+        st.subheader("Arbitrated case review")
+    elif workflow_status == "partial":
+        st.subheader("Partial panel review")
+    else:
+        st.subheader("Provider panel report")
+    render_panel_health(panel)
+    tabs = st.tabs(
+        ["Overview", "Analyses", "Disputes", "Evidence", "Documents", "Ask next steps"]
+    )
     with tabs[0]:
         render_overview(panel)
     with tabs[1]:
-        render_disputes(panel)
+        render_available_analyses(panel)
     with tabs[2]:
-        render_evidence(panel)
+        render_disputes(panel)
     with tabs[3]:
-        render_documents(panel, case_data, config)
+        render_evidence(panel)
     with tabs[4]:
+        render_documents(panel, case_data, config)
+    with tabs[5]:
         render_followup(panel, case_data, config)
 
 
