@@ -6,17 +6,25 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import zipfile
+from io import BytesIO
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
 import streamlit as st
+from docx import Document
+from pypdf import PdfReader
 
 from mariner_core import (
     AppError,
+    MAX_CONTRACT_CHARS,
     ProviderConfig,
     analyze_case,
     answer_followup,
     draft_document,
+    extract_contract_fields,
 )
 
 
@@ -69,7 +77,7 @@ STATIC_CSS = """
 
   /* ---- ground and type ---- */
   .stApp { background: var(--bg); }
-  html, body, .stApp, [class*="css"] { font-family: var(--body); color: var(--ink); }
+  html, body, .stApp { font-family: var(--body); color: var(--ink); }
   .block-container { max-width: 1500px; padding-top: 1.8rem; padding-bottom: 4rem; }
   h1, h2, h3, h4, h5, h6,
   .stMarkdown h1, .stMarkdown h2, .stMarkdown h3, .stMarkdown h4 {
@@ -263,6 +271,35 @@ def as_bool(value: Any) -> bool:
 
 PUBLIC_DEMO_ONLY = as_bool(get_setting("PUBLIC_DEMO_ONLY", False))
 DEMO_MODE = PUBLIC_DEMO_ONLY or as_bool(get_setting("DEMO_MODE", False))
+MAX_CONTRACT_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_CONTRACT_PDF_PAGES = 150
+MAX_DOCX_ENTRIES = 3_000
+MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+CONTRACT_CASE_FIELDS = {
+    "shipName": "Ship name",
+    "imoNumber": "IMO number",
+    "flagState": "Flag state",
+    "role": "Role on board",
+    "employer": "Employer / crewing agency",
+    "shipowner": "Shipowner / operator",
+    "contractTerms": "Employment agreement / CBA",
+}
+CASE_DATA_KEYS = (
+    "situation",
+    "shipName",
+    "imoNumber",
+    "flagState",
+    "role",
+    "employer",
+    "shipowner",
+    "incidentDate",
+    "incidentLocation",
+    "medicalStatus",
+    "contractTerms",
+    "evidence",
+    "communications",
+    "desiredOutcome",
+)
 
 
 def build_config() -> ProviderConfig:
@@ -288,7 +325,7 @@ def require_shared_password() -> None:
     expected = str(get_setting("APP_PASSWORD", "") or "")
     if not expected or st.session_state.get("authenticated"):
         return
-    st.markdown(STATIC_CSS, unsafe_allow_html=True)
+    st.html(STATIC_CSS)
     st.title("⚓ Mariner Advocate")
     st.caption("Private workspace access")
     entered = st.text_input("Shared password", type="password", autocomplete="current-password")
@@ -306,23 +343,260 @@ def require_shared_password() -> None:
 
 
 def collect_case_data() -> dict[str, str]:
-    keys = [
-        "situation",
-        "shipName",
-        "imoNumber",
-        "flagState",
-        "role",
-        "employer",
-        "shipowner",
-        "incidentDate",
-        "incidentLocation",
-        "medicalStatus",
-        "contractTerms",
-        "evidence",
-        "communications",
-        "desiredOutcome",
-    ]
-    return {key: str(st.session_state.get(f"case_{key}", "") or "") for key in keys}
+    return {
+        key: str(st.session_state.get(f"case_{key}", "") or "")
+        for key in CASE_DATA_KEYS
+    }
+
+
+def clear_session_callback() -> None:
+    authenticated = st.session_state.get("authenticated")
+    next_upload_epoch = int(st.session_state.get("contract_upload_epoch", 0) or 0) + 1
+    for key in list(st.session_state):
+        del st.session_state[key]
+    if authenticated:
+        st.session_state.authenticated = authenticated
+    st.session_state.contract_upload_epoch = next_upload_epoch
+    for key in CASE_DATA_KEYS:
+        st.session_state[f"case_{key}"] = ""
+
+
+def invalidate_case_results() -> None:
+    for stale_key in ("panel", "submitted_case", "draft", "discussion"):
+        st.session_state.pop(stale_key, None)
+
+
+def extract_uploaded_contract_text(uploaded_file: Any) -> str:
+    name = str(getattr(uploaded_file, "name", "contract") or "contract")
+    suffix = Path(name).suffix.lower()
+    raw = uploaded_file.getvalue()
+    if not raw:
+        raise AppError("The uploaded contract is empty.")
+    if len(raw) > MAX_CONTRACT_UPLOAD_BYTES:
+        raise AppError("The contract is larger than 10 MB. Upload a smaller copy.")
+
+    try:
+        if suffix == ".pdf":
+            if not raw.lstrip().startswith(b"%PDF-"):
+                raise AppError("The uploaded file is not a valid PDF.")
+            if re.search(rb"/(?:JavaScript|JS|Launch|EmbeddedFile)\b", raw):
+                raise AppError(
+                    "PDFs containing scripts, launch actions, or embedded files are not accepted."
+                )
+            reader = PdfReader(BytesIO(raw))
+            if reader.is_encrypted:
+                raise AppError("The PDF is password-protected. Upload an unlocked copy.")
+            if len(reader.pages) > MAX_CONTRACT_PDF_PAGES:
+                raise AppError("The PDF has more than 150 pages. Upload only the relevant contract.")
+            parts = []
+            for page_number, page in enumerate(reader.pages, start=1):
+                page_text = str(page.extract_text() or "").strip()
+                if page_text:
+                    parts.append(f"[Page {page_number}]\n{page_text}")
+            text = "\n\n".join(parts)
+        elif suffix == ".docx":
+            if not zipfile.is_zipfile(BytesIO(raw)):
+                raise AppError("The uploaded file is not a valid DOCX document.")
+            with zipfile.ZipFile(BytesIO(raw)) as archive:
+                entries = archive.infolist()
+                names = {entry.filename for entry in entries}
+                if "[Content_Types].xml" not in names or "word/document.xml" not in names:
+                    raise AppError("The uploaded file is not a valid DOCX document.")
+                if any(name.lower().endswith("vbaproject.bin") for name in names):
+                    raise AppError("Macro-enabled Word documents are not accepted.")
+                if len(entries) > MAX_DOCX_ENTRIES:
+                    raise AppError("The DOCX contains too many embedded entries.")
+                if any(
+                    entry.filename.startswith(("/", "\\"))
+                    or ".." in PurePosixPath(entry.filename).parts
+                    for entry in entries
+                ):
+                    raise AppError("The DOCX contains unsafe internal paths.")
+                uncompressed_size = sum(entry.file_size for entry in entries)
+                if uncompressed_size > MAX_DOCX_UNCOMPRESSED_BYTES:
+                    raise AppError("The expanded DOCX is too large to process safely.")
+                if any(
+                    entry.file_size > 1_000_000
+                    and entry.file_size / max(entry.compress_size, 1) > 200
+                    for entry in entries
+                ):
+                    raise AppError("The DOCX uses an unsafe compression ratio.")
+            document = Document(BytesIO(raw))
+            parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+            for table_number, table in enumerate(document.tables, start=1):
+                rows = []
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        rows.append(" | ".join(cells))
+                if rows:
+                    parts.append(f"[Table {table_number}]\n" + "\n".join(rows))
+            text = "\n\n".join(parts)
+        elif suffix == ".txt":
+            if b"\x00" in raw:
+                raise AppError("The TXT upload appears to contain binary data.")
+            control_bytes = sum(byte < 32 and byte not in (9, 10, 13) for byte in raw)
+            if control_bytes > max(5, len(raw) // 100):
+                raise AppError("The TXT upload appears to contain binary data.")
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = raw.decode("cp1252")
+        else:
+            raise AppError("Use a PDF, DOCX, or TXT contract file.")
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError(
+            "The contract could not be read. Try exporting it again as PDF, DOCX, or TXT."
+        ) from exc
+
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.replace("\x00", "").splitlines()]
+    text = "\n".join(line for line in lines if line).strip()
+    if len(text) < 40:
+        raise AppError(
+            "The contract has too little readable text. If it is a scan, run OCR and upload it again."
+        )
+    if len(text) > MAX_CONTRACT_CHARS:
+        raise AppError(
+            "The extracted contract is too long. Upload the employment agreement and relevant annexes only."
+        )
+    return text
+
+
+def apply_contract_fields(
+    extraction: dict[str, Any], *, overwrite: bool
+) -> tuple[list[str], list[str]]:
+    fields = extraction.get("fields") if isinstance(extraction.get("fields"), dict) else {}
+    filled: list[str] = []
+    preserved: list[str] = []
+    for field, label in CONTRACT_CASE_FIELDS.items():
+        value = str(fields.get(field) or "").strip()
+        if not value:
+            continue
+        state_key = f"case_{field}"
+        if str(st.session_state.get(state_key, "") or "").strip() and not overwrite:
+            preserved.append(label)
+            continue
+        st.session_state[state_key] = value
+        filled.append(label)
+    if filled:
+        invalidate_case_results()
+    return filled, preserved
+
+
+def render_contract_import_summary() -> None:
+    extraction = st.session_state.get("contract_import_result")
+    if not isinstance(extraction, dict):
+        return
+    filename = str(st.session_state.get("contract_import_filename") or "contract")
+    with st.expander(f"Review last contract import: {filename}"):
+        clauses = extraction.get("importantClauses") or []
+        if clauses:
+            st.markdown("**Relevant clauses found**")
+            for clause in clauses:
+                if not isinstance(clause, dict):
+                    continue
+                topic = str(clause.get("topic") or "Relevant clause")
+                location = str(clause.get("pageOrSection") or "")
+                summary = str(clause.get("summary") or clause.get("quote") or "")
+                st.write(f"{topic}{f' — {location}' if location else ''}: {summary}")
+        missing = [str(item) for item in extraction.get("missingFields") or [] if str(item)]
+        if missing:
+            st.caption("Not found or unclear: " + ", ".join(missing))
+        for warning in extraction.get("warnings") or []:
+            if str(warning):
+                st.warning(str(warning))
+
+
+def apply_pending_contract_import() -> None:
+    pending = st.session_state.pop("pending_contract_import", None)
+    if not isinstance(pending, dict):
+        return
+    extraction = pending.get("extraction")
+    if not isinstance(extraction, dict):
+        return
+    filled, preserved = apply_contract_fields(
+        extraction, overwrite=bool(pending.get("overwrite"))
+    )
+    st.session_state.contract_import_result = extraction
+    st.session_state.contract_import_filename = Path(
+        str(pending.get("filename") or "contract")
+    ).name[:180]
+    st.session_state.contract_import_notice = {
+        "filled": filled,
+        "preserved": preserved,
+    }
+    st.session_state.contract_upload_epoch = (
+        int(st.session_state.get("contract_upload_epoch", 0) or 0) + 1
+    )
+
+
+def render_contract_importer(
+    config: ProviderConfig,
+) -> tuple[Any | None, bool, bool, bool]:
+    st.markdown("#### Import an employment contract")
+    with st.container(border=True):
+        st.caption(
+            "Upload a PDF, DOCX, or TXT copy of the SEA, employment agreement, or CBA. "
+            "The importer fills only contract-related fields, and every value remains editable."
+        )
+        notice = st.session_state.pop("contract_import_notice", None)
+        if isinstance(notice, dict):
+            filled_notice = notice.get("filled") or []
+            preserved_notice = notice.get("preserved") or []
+            if filled_notice:
+                st.success(
+                    "Filled: "
+                    + ", ".join(str(item) for item in filled_notice)
+                    + ". Review before submitting."
+                )
+            else:
+                st.warning("No empty case fields could be filled from this contract.")
+            if preserved_notice:
+                st.info(
+                    "Preserved existing values: "
+                    + ", ".join(str(item) for item in preserved_notice)
+                    + "."
+                )
+
+        if PUBLIC_DEMO_ONLY:
+            st.info(
+                "Contract upload is disabled in the public fictional-data demo. "
+                "Use a reviewed private deployment for document import."
+            )
+            render_contract_import_summary()
+            return None, False, False, False
+
+        uploaded_file = st.file_uploader(
+            "Contract file",
+            type=["pdf", "docx", "txt"],
+            key=f"contract_upload_{int(st.session_state.get('contract_upload_epoch', 0) or 0)}",
+            help="Maximum 10 MB. Scanned PDFs require searchable text/OCR.",
+        )
+        overwrite = st.checkbox(
+            "Replace case fields that already contain text",
+            value=False,
+            key="contract_import_overwrite",
+        )
+        consent = True
+        if not config.demo_mode:
+            consent = st.checkbox(
+                "I understand that the extracted contract text will be sent to OpenAI for field extraction.",
+                key="contract_import_consent",
+            )
+
+        provider_ready = config.demo_mode or bool(config.openai_key)
+        if not provider_ready:
+            st.info("Add OPENAI_API_KEY to enable contract extraction.")
+
+        import_clicked = st.form_submit_button(
+            "Extract and fill contract fields",
+            use_container_width=True,
+            disabled=not provider_ready,
+        )
+        render_contract_import_summary()
+        return uploaded_file, overwrite, consent, import_clicked
 
 
 def safe_list(value: Any) -> list[Any]:
@@ -400,12 +674,11 @@ def render_sidebar(config: ProviderConfig) -> None:
                 use_container_width=True,
             )
 
-        if st.button("Clear this session", use_container_width=True):
-            for key in list(st.session_state):
-                if key == "authenticated":
-                    continue
-                del st.session_state[key]
-            st.rerun()
+        st.button(
+            "Clear this session",
+            use_container_width=True,
+            on_click=clear_session_callback,
+        )
 
         st.divider()
         st.caption(
@@ -457,6 +730,7 @@ def render_header() -> None:
 
 
 def render_intake(config: ProviderConfig) -> None:
+    apply_pending_contract_import()
     missing = []
     if not config.demo_mode:
         if not config.zai_key:
@@ -474,6 +748,12 @@ def render_intake(config: ProviderConfig) -> None:
     st.subheader("Case intake")
     st.caption("Use facts you know and mark uncertain details as uncertain.")
     with st.form("case_intake", border=True):
+        (
+            uploaded_contract,
+            overwrite_contract_fields,
+            contract_import_consent,
+            import_submitted,
+        ) = render_contract_importer(config)
         st.text_area(
             "What happened? *",
             height=220,
@@ -549,14 +829,40 @@ def render_intake(config: ProviderConfig) -> None:
                 key="fictional_data_confirmed",
             )
 
-        submitted = st.form_submit_button(
+        panel_submitted = st.form_submit_button(
             "Run the legal review panel",
             type="primary",
             use_container_width=True,
             disabled=bool(missing),
         )
 
-    if not submitted:
+    if import_submitted:
+        submitted_case = st.session_state.get("submitted_case")
+        if isinstance(submitted_case, dict) and collect_case_data() != submitted_case:
+            invalidate_case_results()
+        if uploaded_contract is None:
+            st.error("Choose a PDF, DOCX, or TXT contract before extracting fields.")
+            return
+        if not contract_import_consent:
+            st.error("Confirm the OpenAI document-extraction notice before continuing.")
+            return
+        try:
+            with st.spinner("Reading the contract and extracting stated terms..."):
+                contract_text = extract_uploaded_contract_text(uploaded_contract)
+                extraction = extract_contract_fields(contract_text, config)
+            st.session_state.pending_contract_import = {
+                "extraction": extraction,
+                "overwrite": overwrite_contract_fields,
+                "filename": str(uploaded_contract.name),
+            }
+            st.rerun()
+        except AppError as exc:
+            st.error(str(exc))
+        except Exception:
+            st.error("The contract import failed because of an unexpected server error.")
+        return
+
+    if not panel_submitted:
         return
     if not fictional_confirmed:
         st.error("Confirm that the public demo contains fictional data before continuing.")
@@ -922,14 +1228,15 @@ def render_results(config: ProviderConfig) -> None:
 def main() -> None:
     require_shared_password()
     config = build_config()
-    st.markdown(STATIC_CSS, unsafe_allow_html=True)
+    st.html(STATIC_CSS)
     render_sidebar(config)
     render_header()
     if not PUBLIC_DEMO_ONLY and not config.demo_mode and not str(get_setting("APP_PASSWORD", "") or ""):
         st.error(
-            "Live mode has no APP_PASSWORD configured. Do not expose this app to the internet. "
-            "Use private authentication and a controlled self-hosted deployment for real cases."
+            "Live mode is locked because APP_PASSWORD is not configured. Add a long random "
+            "password in server secrets, then reload the app."
         )
+        st.stop()
     intake, results = st.columns([0.92, 1.08], gap="large")
     with intake:
         render_intake(config)
