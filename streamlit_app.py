@@ -339,6 +339,9 @@ def build_config() -> ProviderConfig:
         "zai_max_tokens": int_setting(
             "ZAI_MAX_TOKENS", 32_000, low=4_000, high=128_000
         ),
+        "openai_max_output_tokens": int_setting(
+            "OPENAI_MAX_OUTPUT_TOKENS", 32_000, low=4_000, high=128_000
+        ),
     }
 
     # Streamlit re-executes this script on every rerun but keeps imported

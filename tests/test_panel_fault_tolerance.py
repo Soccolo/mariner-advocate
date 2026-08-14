@@ -259,6 +259,25 @@ class PanelFaultToleranceTests(unittest.TestCase):
         # The arbiter must know a source analysis was cut short before weighing it.
         self.assertIn('"errorType": "truncated_response"', prompts["arbitration"])
 
+    def test_truncated_arbitration_is_flagged_to_the_reader(self):
+        truncated = dict(ARBITRATION)
+        truncated["responseTruncated"] = True
+
+        def fake_call(_provider, _prompt, _config, **kwargs):
+            kind = kwargs["demo_kind"]
+            if kind == "arbitration":
+                return dict(truncated)
+            return dict({"first": FIRST, "independent": INDEPENDENT, "critique": CRITIQUE}[kind])
+
+        with patch("mariner_core.call_provider", side_effect=fake_call):
+            panel = analyze_case(CASE, self.config)
+
+        self.assertEqual(panel["providerFailures"], [])
+        self.assertEqual(
+            [warning["stage"] for warning in panel["providerWarnings"]], ["arbitration"]
+        )
+        self.assertEqual(panel["workflow"]["status"], "degraded")
+
     def test_provider_error_text_is_redacted_before_reuse(self):
         secret_echo = "SECRET-CASE-TEXT"
         panel, prompts = self.run_panel(

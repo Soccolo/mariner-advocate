@@ -79,6 +79,13 @@ tokens rather than the answer-sized budget a non-reasoning model would need.
   set `thinking` and `effort` explicitly. If a model or account does not accept the
   structured-output or effort fields, the request is retried without them instead of
   failing the stage.
+- OpenAI arbitration streams for the same reason: it runs at high reasoning effort in
+  pro mode, and a single non-streaming request has to finish inside one HTTP timeout
+  while a stream only has to keep sending. Pro mode and the verbosity control are
+  dropped one at a time if a model or account rejects them, and a deployment that
+  blocks streamed responses falls back to a single request rather than losing the
+  synthesis. If arbitration keeps timing out, raise `REQUEST_TIMEOUT_SECONDS`
+  (maximum 900) before lowering reasoning effort.
 - When a model still stops mid-answer, the complete leading part of its response is
   recovered and used. Cuts are only made at separators outside strings, so every value
   kept is one the model finished writing, and anything it was part-way through is
@@ -145,6 +152,7 @@ Supported settings:
 | `ANTHROPIC_MAX_TOKENS` | `32000` | Claude output allowance, covering thinking and the answer (4,000-128,000) |
 | `ANTHROPIC_EFFORT` | `high` | Claude reasoning depth: `low`, `medium`, `high`, `xhigh`, or `max` |
 | `ZAI_MAX_TOKENS` | `32000` | Z.AI output allowance, covering reasoning and the answer (4,000-128,000) |
+| `OPENAI_MAX_OUTPUT_TOKENS` | `32000` | OpenAI output allowance, covering reasoning and the answer (4,000-128,000) |
 | `APP_PASSWORD` | none | Basic shared-password gate |
 | `DEMO_MODE` | `false` | Use deterministic fake responses and no APIs |
 | `PUBLIC_DEMO_ONLY` | `false` | Force demo mode and require fictional-data acknowledgment |
